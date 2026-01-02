@@ -1,0 +1,38 @@
+# Build directory
+build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled files
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.hex
+*.uf2
+*.dis
+*.map
+
+# PIO generated headers
+*.pio.h
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# pioasm build artifacts
+pioasm-install/
+
+# pico-sdk (not a submodule, built locally)
+pico-sdk/

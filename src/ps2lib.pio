@@ -1,0 +1,16 @@
+.program ps2lib
+.side_set 1 opt         ; Side-set pin uses 1 bit
+
+.wrap_target
+    pull block          ; Wait for data from FIFO
+    set x, 10           ; 11 bits to send (0-10)
+    
+bit_loop:
+    out pins, 1 side 1 [7]  ; CLK high for 8 cycles (1 instr + 7 delay)
+    nop side 0 [7]          ; CLK low for 8 cycles (1 instr + 7 delay)
+    jmp x-- bit_loop    ; Loop (1 cycle)
+    
+    ; Idle state
+    set pins, 1 side 1  ; Both lines high
+    nop [7]             ; Short delay before next byte
+.wrap
