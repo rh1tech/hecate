@@ -1,160 +1,579 @@
+/*
+ * Hecate - USB to PS/2 Keyboard and Mouse Converter
+ *
+ * This file contains the main entry point and USB HID host implementation.
+ * It handles USB device enumeration, HID report parsing, and dispatches
+ * keyboard and mouse events to the respective PS/2 emulation drivers.
+ *
+ * Features:
+ *   - Dual PIO-USB host ports (GPIO 2/3 and GPIO 4/5)
+ *   - HID report descriptor parsing for non-boot protocol devices
+ *   - NKRO (N-Key Rollover) keyboard support
+ *   - IntelliMouse and IntelliMouse Explorer support
+ *   - USB hub support for connecting multiple devices
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
 #include "hardware/clocks.h"
-#include "ps2lib.h"
-#include "scancodes.h"
-#include "hid_to_ps2.h"
-#include "usb_keyboard.h"
+#include "ps2_keyboard.h"
+#include "ps2_mouse.h"
 #include "pio_usb.h"
 #include "tusb.h"
+#include "bsp/board_api.h"
 
 #define LED_PIN 25
 
-// Callback from USB keyboard driver when a key event occurs
-void on_keyboard_event(uint8_t modifiers, uint8_t keycode, bool pressed) {
-    printf("Key event: mod=0x%02X, key=0x%02X, %s\n", 
-           modifiers, keycode, pressed ? "pressed" : "released");
-    
-    // Convert HID keycode to PS/2 and send
-    send_ps2_key(keycode, pressed);
+// Dual PIO-USB Host GPIO configuration
+// Port 0: GPIO 2 (D+) / GPIO 3 (D-)
+// Port 1: GPIO 4 (D+) / GPIO 5 (D-) - added via pio_usb_host_add_port
+#define USB0_DP_PIN 2
+#define USB1_DP_PIN 4
+
+//--------------------------------------------------------------------
+// HID Report Parsing Structures
+//--------------------------------------------------------------------
+
+#define MAX_BOOT 6
+#define MAX_NKRO 16
+#define MAX_REPORT 8
+#define MAX_REPORT_ITEMS 32
+
+typedef struct {
+    u16 page;
+    u16 usage;
+} hid_usage_t;
+
+typedef struct {
+    s32 min;
+    s32 max;
+} hid_minmax_t;
+
+typedef struct {
+    hid_usage_t usage;
+    hid_minmax_t logical;
+} hid_report_item_attributes_t;
+
+typedef struct {
+    u16 bit_offset;
+    u8 bit_size;
+    u8 item_type;
+    hid_report_item_attributes_t attributes;
+} hid_report_item_t;
+
+typedef struct {
+    u8 report_id;
+    u8 usage;
+    u16 usage_page;
+    u8 num_items;
+    hid_report_item_t item[MAX_REPORT_ITEMS];
+} hid_report_info_t;
+
+typedef struct {
+    const hid_report_item_t *x;
+    const hid_report_item_t *y;
+    const hid_report_item_t *z;
+    const hid_report_item_t *lb;
+    const hid_report_item_t *mb;
+    const hid_report_item_t *rb;
+    const hid_report_item_t *bw;
+    const hid_report_item_t *fw;
+} ms_items_t;
+
+typedef struct {
+    u8 report_count;
+    hid_report_info_t report_info[MAX_REPORT];
+    u8 dev_addr;
+    u8 modifiers;
+    u8 boot[MAX_BOOT];
+    u8 nkro[MAX_NKRO];
+    bool leds;
+    bool is_mouse;
+} hid_instance_t;
+
+static hid_instance_t hid_info[CFG_TUH_HID];
+static ms_items_t ms_items;
+
+// LED sync variables
+static u8 kb_inst_loop = 0;
+static u8 kb_last_dev = 0;
+extern u8 kb_set_led;
+
+//--------------------------------------------------------------------
+// HID Report Descriptor Parsing
+//--------------------------------------------------------------------
+
+static bool hid_parse_find_bit_item_by_page(hid_report_info_t* info, u8 type, u16 page, u8 bit, const hid_report_item_t **item) {
+    for (u8 i = 0; i < info->num_items; i++) {
+        if (info->item[i].item_type == type && info->item[i].attributes.usage.page == page) {
+            if (item) {
+                if (i + bit < info->num_items && info->item[i + bit].item_type == type && 
+                    info->item[i + bit].attributes.usage.page == page) {
+                    *item = &info->item[i + bit];
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
-// Core 1: USB host task
-void core1_main(void) {
-    sleep_ms(10);
-    
-    // Configure PIO-USB
-    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-    pio_cfg.pin_dp = USB1_DP_PIN;
-    
-    // Initialize TinyUSB host with PIO-USB
-    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
-    tuh_init(BOARD_TUH_RHPORT);
-    
-    printf("USB Host started on Core 1 (GPIO %d/%d)\n", USB1_DP_PIN, USB1_DP_PIN + 1);
-    
-    while (true) {
-        tuh_task();
+static bool hid_parse_find_item_by_usage(hid_report_info_t* info, u8 type, u16 usage, const hid_report_item_t **item) {
+    for (u8 i = 0; i < info->num_items; i++) {
+        if (info->item[i].item_type == type && info->item[i].attributes.usage.usage == usage) {
+            if (item) {
+                *item = &info->item[i];
+            }
+            return true;
+        }
     }
+    return false;
 }
 
-int main() {
-    // Set system clock to 120MHz for USB timing
-    set_sys_clock_khz(120000, true);
-    
-    // Initialize stdio for USB serial
-    stdio_init_all();
+static bool hid_parse_get_item_value(const hid_report_item_t *item, const u8 *report, u8 len, s32 *value) {
+    (void)len;
+    if (item == NULL || report == NULL) return false;
+    u8 boffs = item->bit_offset & 0x07;
+    u8 pos = 8 - boffs;
+    u8 offs = item->bit_offset >> 3;
+    u32 mask = ~(0xffffffff << item->bit_size);
+    s32 val = report[offs++] >> boffs;
+    while (item->bit_size > pos) {
+        val |= (report[offs++] << pos);
+        pos += 8;
+    }
+    val &= mask;
+    if (item->attributes.logical.min < 0) {
+        if (val & (1 << (item->bit_size - 1))) {
+            val |= (0xffffffff << item->bit_size);
+        }
+    }
+    *value = val;
+    return true;
+}
 
-    // Initialize the GPIO pin for LED
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
+static s8 to_signed_value8(const hid_report_item_t *item, const u8 *report, u16 len) {
+    s32 value = 0;
+    if (hid_parse_get_item_value(item, report, len, &value)) {
+        value = (value > 127) ? 127 : (value < -127) ? -127 : value;
+    }
+    return value;
+}
 
-    // Initialize PS/2 keyboard emulation (uses PIO)
-    ps2lib_init();
+static bool to_bit_value(const hid_report_item_t *item, const u8 *report, u16 len) {
+    s32 value = 0;
+    hid_parse_get_item_value(item, report, len, &value);
+    return value ? true : false;
+}
 
-    // Wait a bit for USB serial to enumerate
-    sleep_ms(1000);
-    
-    printf("\n=================================\n");
-    printf("USB to PS/2 Keyboard Converter\n");
-    printf("=================================\n");
-    printf("PS/2: CLK=GPIO%d, DATA=GPIO%d\n", PS2_CLK_PIN, PS2_DATA_PIN);
-    printf("USB:  D+=GPIO%d, D-=GPIO%d\n", USB1_DP_PIN, USB1_DP_PIN + 1);
-    printf("\n");
-    
-    // Start USB host on Core 1
-    multicore_reset_core1();
-    multicore_launch_core1(core1_main);
-    
-    // Main loop on Core 0 - blink LED to show we're alive
-    while (true) {
-        gpio_put(LED_PIN, 1);
-        sleep_ms(500);
-        gpio_put(LED_PIN, 0);
-        sleep_ms(500);
+static u8 hid_parse_report_descriptor(hid_report_info_t* report_info_arr, u8 arr_count, u8 const* desc_report, u16 desc_len) {
+    union __attribute__((packed)) {
+        u8 byte;
+        struct __attribute__((packed)) {
+            u8 size: 2;
+            u8 type: 2;
+            u8 tag: 4;
+        };
+    } header;
+
+    memset(report_info_arr, 0, arr_count * sizeof(hid_report_info_t));
+
+    u8 report_num = 0;
+    hid_report_info_t* info = report_info_arr;
+
+    u16 ri_global_usage_page = 0;
+    s32 ri_global_logical_min = 0;
+    s32 ri_global_logical_max = 0;
+    u8 ri_report_count = 0;
+    u8 ri_report_size = 0;
+    u8 ri_report_usage_count = 0;
+    u8 ri_collection_depth = 0;
+
+    while (desc_len && report_num < arr_count) {
+        header.byte = *desc_report++;
+        desc_len--;
+
+        u8 const tag = header.tag;
+        u8 const type = header.type;
+        u8 const size = header.size;
+
+        u32 data;
+        s32 sdata;
+        switch (size) {
+            case 1: data = desc_report[0]; sdata = ((data & 0x80) ? 0xffffff00 : 0) | data; break;
+            case 2: data = (desc_report[1] << 8) | desc_report[0]; sdata = ((data & 0x8000) ? 0xffff0000 : 0) | data; break;
+            case 3: data = (desc_report[3] << 24) | (desc_report[2] << 16) | (desc_report[1] << 8) | desc_report[0]; sdata = data; break;
+            default: data = 0; sdata = 0;
+        }
+
+        u16 offset;
+        switch (type) {
+            case 0: // Main
+                switch (tag) {
+                    case 8: // Input
+                    case 9: // Output
+                    case 11: // Feature
+                        offset = (info->num_items == 0) ? 0 : (info->item[info->num_items - 1].bit_offset + info->item[info->num_items - 1].bit_size);
+                        if (ri_report_usage_count > ri_report_count) {
+                            info->num_items += ri_report_usage_count - ri_report_count;
+                        }
+                        for (u8 i = 0; i < ri_report_count; i++) {
+                            if (info->num_items + i < MAX_REPORT_ITEMS) {
+                                info->item[info->num_items + i].bit_offset = offset;
+                                info->item[info->num_items + i].bit_size = ri_report_size;
+                                info->item[info->num_items + i].item_type = tag;
+                                info->item[info->num_items + i].attributes.logical.min = ri_global_logical_min;
+                                info->item[info->num_items + i].attributes.logical.max = ri_global_logical_max;
+                                info->item[info->num_items + i].attributes.usage.page = ri_global_usage_page;
+                                if (ri_report_usage_count != ri_report_count && ri_report_usage_count > 0) {
+                                    if (i >= ri_report_usage_count) {
+                                        info->item[info->num_items + i].attributes.usage = info->item[info->num_items + i - 1].attributes.usage;
+                                    }
+                                }
+                            }
+                            offset += ri_report_size;
+                        }
+                        info->num_items += ri_report_count;
+                        ri_report_usage_count = 0;
+                        break;
+
+                    case 10: // Collection
+                        ri_report_usage_count = 0;
+                        ri_report_count = 0;
+                        ri_collection_depth++;
+                        break;
+
+                    case 12: // End Collection
+                        ri_collection_depth--;
+                        if (ri_collection_depth == 0) {
+                            info++;
+                            report_num++;
+                        }
+                        break;
+                }
+                break;
+
+            case 1: // Global
+                switch (tag) {
+                    case 0: // Usage Page
+                        if (ri_collection_depth == 0) {
+                            info->usage_page = data;
+                        }
+                        ri_global_usage_page = data;
+                        break;
+                    case 1: ri_global_logical_min = sdata; break;
+                    case 2: ri_global_logical_max = sdata; break;
+                    case 7: ri_report_size = data; break;
+                    case 8: info->report_id = data; break;
+                    case 9: ri_report_count = data; break;
+                }
+                break;
+
+            case 2: // Local
+                if (tag == 0) { // Usage
+                    if (ri_collection_depth == 0) {
+                        info->usage = data;
+                    } else {
+                        if (ri_report_usage_count < MAX_REPORT_ITEMS) {
+                            info->item[info->num_items + ri_report_usage_count].attributes.usage.usage = data;
+                            ri_report_usage_count++;
+                        }
+                    }
+                }
+                break;
+        }
+
+        desc_report += size;
+        desc_len -= size;
     }
 
-    return 0;
+    return report_num;
+}
+
+//--------------------------------------------------------------------
+// Mouse Report Handling
+//--------------------------------------------------------------------
+
+static void ms_setup(hid_report_info_t *info) {
+    memset(&ms_items, 0, sizeof(ms_items_t));
+    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_X, &ms_items.x);
+    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_Y, &ms_items.y);
+    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_WHEEL, &ms_items.z);
+    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 0, &ms_items.lb);
+    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 1, &ms_items.rb);
+    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 2, &ms_items.mb);
+    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 3, &ms_items.bw);
+    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 4, &ms_items.fw);
+}
+
+static void ms_report_receive(u8 const* report, u16 len) {
+    u8 buttons = 0;
+    s8 x, y, z;
+
+    if (to_bit_value(ms_items.lb, report, len)) buttons |= 0x01;
+    if (to_bit_value(ms_items.rb, report, len)) buttons |= 0x02;
+    if (to_bit_value(ms_items.mb, report, len)) buttons |= 0x04;
+    if (to_bit_value(ms_items.bw, report, len)) buttons |= 0x08;
+    if (to_bit_value(ms_items.fw, report, len)) buttons |= 0x10;
+
+    x = to_signed_value8(ms_items.x, report, len);
+    y = to_signed_value8(ms_items.y, report, len);
+    z = to_signed_value8(ms_items.z, report, len);
+
+    ps2_mouse_send_movement(buttons, x, y, z);
+}
+
+//--------------------------------------------------------------------
+// LED Sync Callback
+//--------------------------------------------------------------------
+
+s64 kb_led_sync_callback(alarm_id_t id, void *user_data) {
+    (void)id;
+    (void)user_data;
+    
+    if (hid_info[kb_inst_loop].leds && kb_last_dev != hid_info[kb_inst_loop].dev_addr) {
+        tuh_hid_set_report(hid_info[kb_inst_loop].dev_addr, kb_inst_loop, 0, HID_REPORT_TYPE_OUTPUT, &kb_set_led, 1);
+        kb_last_dev = hid_info[kb_inst_loop].dev_addr;
+    }
+
+    kb_inst_loop++;
+
+    if (kb_inst_loop == CFG_TUH_HID) {
+        kb_inst_loop = 0;
+        kb_last_dev = 0;
+        return 0;
+    }
+
+    return 1000;
 }
 
 //--------------------------------------------------------------------
 // TinyUSB HID Host Callbacks
 //--------------------------------------------------------------------
 
-// Previous keyboard state for detecting changes
-static uint8_t prev_modifiers = 0;
-static uint8_t prev_keys[6] = {0};
-
-static bool key_in_array(uint8_t keycode, const uint8_t *array, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        if (array[i] == keycode) return true;
+void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_len) {
+    if (desc_report == NULL && desc_len == 0) {
+        printf("WARNING: HID(%d,%d) skipped - descriptor too large!\n", dev_addr, instance);
+        return;
     }
-    return false;
-}
 
-void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len) {
-    (void)desc_report;
-    (void)desc_len;
-    
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-    printf("HID mounted: dev=%d inst=%d protocol=%d\n", dev_addr, instance, itf_protocol);
-    
-    // Only handle keyboard (protocol 1)
-    if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
-        printf("Keyboard detected!\n");
-        if (!tuh_hid_receive_report(dev_addr, instance)) {
-            printf("Failed to request report\n");
+    hid_interface_protocol_enum_t hid_if_proto = tuh_hid_interface_protocol(dev_addr, instance);
+    u16 vid, pid;
+    tuh_vid_pid_get(dev_addr, &vid, &pid);
+
+    char* hidprotostr = "generic";
+    if (hid_if_proto == HID_ITF_PROTOCOL_KEYBOARD) hidprotostr = "keyboard";
+    if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) hidprotostr = "mouse";
+
+    printf("\nHID(%d,%d,%s) mounted\n", dev_addr, instance, hidprotostr);
+    printf(" VID: %04x  PID: %04x\n", vid, pid);
+
+    hid_info[instance].report_count = hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
+    printf(" HID has %u reports\n", hid_info[instance].report_count);
+
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+        printf(" ERROR: Could not register for HID(%d,%d,%s)!\n", dev_addr, instance, hidprotostr);
+    } else {
+        printf(" HID(%d,%d,%s) registered for reports\n", dev_addr, instance, hidprotostr);
+
+        if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
+            hid_info[instance].leds = false;
+            hid_info[instance].is_mouse = true;
+        } else {
+            hid_info[instance].dev_addr = dev_addr;
+            hid_info[instance].modifiers = 0;
+            memset(hid_info[instance].boot, 0, MAX_BOOT);
+            memset(hid_info[instance].nkro, 0, MAX_NKRO);
+            hid_info[instance].leds = true;
+            hid_info[instance].is_mouse = false;
         }
+
+        board_led_write(1);
     }
 }
 
-void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
-    printf("HID unmounted: dev=%d inst=%d\n", dev_addr, instance);
-    // Reset state
-    prev_modifiers = 0;
-    memset(prev_keys, 0, sizeof(prev_keys));
+void tuh_hid_umount_cb(u8 dev_addr, u8 instance) {
+    printf("HID(%d,%d) unmounted\n", dev_addr, instance);
+    hid_info[instance].dev_addr = 0;
+    hid_info[instance].leds = false;
+    hid_info[instance].is_mouse = false;
 }
 
-void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-    
-    if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD && len >= 8) {
-        uint8_t modifiers = report[0];
-        const uint8_t *keys = &report[2];
-        
-        // Check modifier changes
-        uint8_t mod_changed = modifiers ^ prev_modifiers;
-        if (mod_changed) {
-            if (mod_changed & 0x01) on_keyboard_event(modifiers, 0xE0, modifiers & 0x01); // L Ctrl
-            if (mod_changed & 0x02) on_keyboard_event(modifiers, 0xE1, modifiers & 0x02); // L Shift
-            if (mod_changed & 0x04) on_keyboard_event(modifiers, 0xE2, modifiers & 0x04); // L Alt
-            if (mod_changed & 0x08) on_keyboard_event(modifiers, 0xE3, modifiers & 0x08); // L GUI
-            if (mod_changed & 0x10) on_keyboard_event(modifiers, 0xE4, modifiers & 0x10); // R Ctrl
-            if (mod_changed & 0x20) on_keyboard_event(modifiers, 0xE5, modifiers & 0x20); // R Shift
-            if (mod_changed & 0x40) on_keyboard_event(modifiers, 0xE6, modifiers & 0x40); // R Alt
-            if (mod_changed & 0x80) on_keyboard_event(modifiers, 0xE7, modifiers & 0x80); // R GUI
-        }
-        
-        // Check for released keys
-        for (int i = 0; i < 6; i++) {
-            if (prev_keys[i] && !key_in_array(prev_keys[i], keys, 6)) {
-                on_keyboard_event(modifiers, prev_keys[i], false);
+void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 len) {
+    u8 const rpt_count = hid_info[instance].report_count;
+    hid_report_info_t *rpt_infos = hid_info[instance].report_info;
+    hid_report_info_t *rpt_info = NULL;
+
+    if (rpt_count == 1 && rpt_infos[0].report_id == 0) {
+        rpt_info = &rpt_infos[0];
+    } else {
+        u8 const rpt_id = report[0];
+        for (u8 i = 0; i < rpt_count; i++) {
+            if (rpt_id == rpt_infos[i].report_id) {
+                rpt_info = &rpt_infos[i];
+                break;
             }
         }
-        
-        // Check for pressed keys
-        for (int i = 0; i < 6; i++) {
-            if (keys[i] && !key_in_array(keys[i], prev_keys, 6)) {
-                on_keyboard_event(modifiers, keys[i], true);
-            }
-        }
-        
-        prev_modifiers = modifiers;
-        memcpy(prev_keys, keys, 6);
+        report++;
+        len--;
+    }
+
+    if (!rpt_info) {
+        tuh_hid_receive_report(dev_addr, instance);
+        return;
     }
     
-    // Request next report
+    board_led_write(1);
     tuh_hid_receive_report(dev_addr, instance);
+
+    // Handle mouse reports
+    if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_MOUSE) {
+        if (tuh_hid_get_protocol(dev_addr, instance) == HID_PROTOCOL_BOOT) {
+            // Boot protocol mouse
+            ps2_mouse_send_movement(report[0], report[1], report[2], len > 3 ? report[3] : 0);
+        } else if (rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP && rpt_info->usage == HID_USAGE_DESKTOP_MOUSE) {
+            ms_setup(rpt_info);
+            ms_report_receive(report, len);
+        } else {
+            printf("UNKNOWN mouse  usage_page: %02x  usage: %02x\n", rpt_info->usage_page, rpt_info->usage);
+        }
+        return;
+    }
+
+    // Handle keyboard reports
+    if (rpt_info->usage_page != HID_USAGE_PAGE_DESKTOP || rpt_info->usage != HID_USAGE_DESKTOP_KEYBOARD) {
+        printf("UNKNOWN key  usage_page: %02x  usage: %02x\n", rpt_info->usage_page, rpt_info->usage);
+        return;
+    }
+
+    // Process modifier changes
+    if (report[0] != hid_info[instance].modifiers) {
+        for (u8 i = 0; i < 8; i++) {
+            if ((report[0] >> i & 1) != (hid_info[instance].modifiers >> i & 1)) {
+                ps2_keyboard_send_key(i + HID_KEY_CONTROL_LEFT, report[0] >> i & 1);
+            }
+        }
+        hid_info[instance].modifiers = report[0];
+    }
+
+    report++;
+    len--;
+
+    // NKRO handling (len > 12 and < 31)
+    if (len > 12 && len < 31) {
+        for (u8 i = 0; i < len && i < MAX_NKRO; i++) {
+            for (u8 j = 0; j < 8; j++) {
+                if ((report[i] >> j & 1) != (hid_info[instance].nkro[i] >> j & 1)) {
+                    ps2_keyboard_send_key(i * 8 + j, report[i] >> j & 1);
+                }
+            }
+        }
+        memcpy(hid_info[instance].nkro, report, len > MAX_NKRO ? MAX_NKRO : len);
+        return;
+    }
+
+    // Boot protocol / 6KRO handling
+    switch (len) {
+        case 8:
+        case 7:
+            report++;
+            // fall through
+        case 6:
+            // Check for released keys
+            for (u8 i = 0; i < MAX_BOOT; i++) {
+                if (hid_info[instance].boot[i]) {
+                    bool brk = true;
+                    for (u8 j = 0; j < MAX_BOOT; j++) {
+                        if (hid_info[instance].boot[i] == report[j]) {
+                            brk = false;
+                            break;
+                        }
+                    }
+                    if (brk) ps2_keyboard_send_key(hid_info[instance].boot[i], false);
+                }
+            }
+
+            // Check for pressed keys
+            for (u8 i = 0; i < MAX_BOOT; i++) {
+                if (report[i]) {
+                    bool make = true;
+                    for (u8 j = 0; j < MAX_BOOT; j++) {
+                        if (report[i] == hid_info[instance].boot[j]) {
+                            make = false;
+                            break;
+                        }
+                    }
+                    if (make) ps2_keyboard_send_key(report[i], true);
+                }
+            }
+
+            memcpy(hid_info[instance].boot, report, MAX_BOOT);
+            return;
+    }
+
+    printf("UNKNOWN keyboard  len: %d\n", len);
+}
+
+//--------------------------------------------------------------------
+// Main
+//--------------------------------------------------------------------
+
+int main() {
+    // Set system clock to 120MHz for USB timing
+    set_sys_clock_khz(120000, true);
+    
+    // Initialize board
+    board_init();
+    board_led_write(1);
+    
+    // Initialize stdio for USB serial debug
+    stdio_init_all();
+    
+    // Wait a bit for USB serial to enumerate
+    sleep_ms(1000);
+    
+    printf("\n=================================\n");
+    printf("USB to PS/2 Keyboard & Mouse\n");
+    printf("=================================\n");
+    
+    // Initialize PS/2 keyboard emulation
+    ps2_keyboard_init();
+    
+    // Initialize PS/2 mouse emulation
+    ps2_mouse_init();
+    
+    printf("USB0: D+=GPIO%d, D-=GPIO%d\n", USB0_DP_PIN, USB0_DP_PIN + 1);
+    printf("USB1: D+=GPIO%d, D-=GPIO%d\n", USB1_DP_PIN, USB1_DP_PIN + 1);
+    printf("\n");
+
+    // Configure and initialize PIO-USB host
+    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
+    
+    // Configure USB port 0 (GPIO 2/3)
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = USB0_DP_PIN;
+    tuh_configure(0, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
+    tuh_init(0);
+    
+    // Add USB port 1 (GPIO 4/5) as additional root port
+    // This shares the PIO state machines with port 0
+    if (pio_usb_host_add_port(USB1_DP_PIN, PIO_USB_PINOUT_DPDM) != 0) {
+        printf("Warning: Failed to add USB port 1\n");
+    }
+    
+    printf("Dual PIO-USB Host started\n");
+    
+    // Main loop
+    while (true) {
+        tuh_task();
+        ps2_keyboard_task();
+        ps2_mouse_task();
+    }
+
+    return 0;
 }

@@ -17,12 +17,13 @@ add_subdirectory(pico-pio-usb)
 # Add executable
 add_executable(hecate
     src/main.c
-    src/ps2lib.c
-    src/hid_to_ps2.c
+    src/ps2out.c
+    src/ps2_keyboard.c
+    src/ps2_mouse.c
 )
 
-# Generate PIO header
-pico_generate_pio_header(hecate ${CMAKE_CURRENT_LIST_DIR}/src/ps2lib.pio)
+# Generate PIO headers
+pico_generate_pio_header(hecate ${CMAKE_CURRENT_LIST_DIR}/src/ps2out.pio)
 
 # Include directories
 target_include_directories(hecate PRIVATE
