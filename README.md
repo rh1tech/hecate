@@ -6,6 +6,10 @@ USB to PS/2 Keyboard and Mouse Converter for Raspberry Pi Pico
 
 Hecate is a firmware for the Raspberry Pi Pico (RP2040) that converts USB keyboards and mice to PS/2 protocol. It allows you to use modern USB peripherals with vintage computers and systems that only support PS/2 input devices.
 
+### Why Hecate?
+
+Named after Hecate, the ancient Greek goddess of crossroads and liminal spaces. Just as Hecate stands at the intersection of worlds, this project bridges the gap between modern USB devices and legacy PS/2 systems—a converter standing at the crossroads of old and new technology.
+
 ## Features
 
 ### USB Host
@@ -28,6 +32,12 @@ Hecate is a firmware for the Raspberry Pi Pico (RP2040) that converts USB keyboa
 - **IntelliMouse Explorer** - 5-button support (auto-detected)
 - **Host commands** - Reset, Get ID, Enable/Disable streaming, Status request
 
+### Status LED
+- **Connection indicator** - LED on when keyboard or mouse is connected
+- **Activity indicator** - LED blinks on keypress or mouse button click
+- **RP2040-Zero RGB** - Green when connected, blue flash on activity
+- **Pico onboard LED** - On when connected, blinks on activity
+
 ## Pin Configuration
 
 | Function | GPIO | Description |
@@ -40,6 +50,20 @@ Hecate is a firmware for the Raspberry Pi Pico (RP2040) that converts USB keyboa
 | PS/2 KB CLK | GPIO 12 | Keyboard Clock line |
 | PS/2 MS DATA | GPIO 14 | Mouse Data line |
 | PS/2 MS CLK | GPIO 15 | Mouse Clock line |
+
+## Supported Boards
+
+### Raspberry Pi Pico (default)
+- Onboard LED on GPIO 25
+- Build with default settings
+
+### Waveshare RP2040-Zero
+- WS2812 RGB LED on GPIO 16
+- Build with `-DUSE_WS2812=1`
+
+```bash
+cmake -DUSE_WS2812=1 ..
+```
 
 ## Building
 
@@ -103,27 +127,7 @@ For a USB Type-A connector:
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 Mikhail Matveev <xtreme@rh1.tech>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT License - See [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
