@@ -16,7 +16,6 @@
  */
 
 #include "ps2_mouse.h"
-#include <stdio.h>
 
 static ps2out ms_out;
 
@@ -127,10 +126,8 @@ static void ms_receive(u8 byte, u8 prev_byte) {
             // IntelliMouse magic sequence detection
             if (ms_type == 0 && ms_magic_seq == 0xc86450) {
                 ms_type = 3;  // IntelliMouse (3-button + wheel)
-                printf("Mouse: IntelliMouse mode enabled\n");
             } else if (ms_type == 3 && ms_magic_seq == 0xc8c850) {
                 ms_type = 4;  // IntelliMouse Explorer (5-button + wheel)
-                printf("Mouse: IntelliMouse Explorer mode enabled\n");
             }
 
             ms_reset();
@@ -154,7 +151,6 @@ static void ms_receive(u8 byte, u8 prev_byte) {
                     ms_streaming = true;
                     ms_reset();
                     add_alarm_in_ms(100, ms_send_callback, NULL, false);
-                    printf("Mouse: Streaming enabled\n");
                     break;
 
                 case 0xf2: // Get Device ID
@@ -198,6 +194,4 @@ void ps2_mouse_init(void) {
     // Keyboard uses state machines 0 and 1
     ps2out_init(&ms_out, 2, PS2_MOUSE_DATA_PIN, &ms_receive);
     ms_reset_callback(0, NULL);
-    printf("PS/2 Mouse initialized: DATA=GPIO%d, CLK=GPIO%d\n", 
-           PS2_MOUSE_DATA_PIN, PS2_MOUSE_CLK_PIN);
 }

@@ -15,17 +15,15 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
+#include "bsp/board_api.h"
 #include "ps2_keyboard.h"
 #include "ps2_mouse.h"
+#include "led.h"
 #include "pio_usb.h"
 #include "tusb.h"
-#include "bsp/board_api.h"
-
-#define LED_PIN 25
 
 // Dual PIO-USB Host GPIO configuration
 // Port 0: GPIO 2 (D+) / GPIO 3 (D-)
@@ -96,6 +94,10 @@ typedef struct {
 
 static hid_instance_t hid_info[CFG_TUH_HID];
 static ms_items_t ms_items;
+
+// Connection tracking for LED
+static u8 kb_connected_count = 0;
+static u8 ms_connected_count = 0;
 
 // LED sync variables
 static u8 kb_inst_loop = 0;
@@ -312,6 +314,7 @@ static void ms_setup(hid_report_info_t *info) {
 }
 
 static void ms_report_receive(u8 const* report, u16 len) {
+    static u8 prev_buttons = 0;
     u8 buttons = 0;
     s8 x, y, z;
 
@@ -324,6 +327,12 @@ static void ms_report_receive(u8 const* report, u16 len) {
     x = to_signed_value8(ms_items.x, report, len);
     y = to_signed_value8(ms_items.y, report, len);
     z = to_signed_value8(ms_items.z, report, len);
+
+    // Blink LED on button press/release (not movement)
+    if (buttons != prev_buttons) {
+        led_blink_activity();
+        prev_buttons = buttons;
+    }
 
     ps2_mouse_send_movement(buttons, x, y, z);
 }
@@ -358,32 +367,18 @@ s64 kb_led_sync_callback(alarm_id_t id, void *user_data) {
 
 void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_len) {
     if (desc_report == NULL && desc_len == 0) {
-        printf("WARNING: HID(%d,%d) skipped - descriptor too large!\n", dev_addr, instance);
         return;
     }
 
     hid_interface_protocol_enum_t hid_if_proto = tuh_hid_interface_protocol(dev_addr, instance);
-    u16 vid, pid;
-    tuh_vid_pid_get(dev_addr, &vid, &pid);
-
-    char* hidprotostr = "generic";
-    if (hid_if_proto == HID_ITF_PROTOCOL_KEYBOARD) hidprotostr = "keyboard";
-    if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) hidprotostr = "mouse";
-
-    printf("\nHID(%d,%d,%s) mounted\n", dev_addr, instance, hidprotostr);
-    printf(" VID: %04x  PID: %04x\n", vid, pid);
 
     hid_info[instance].report_count = hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
-    printf(" HID has %u reports\n", hid_info[instance].report_count);
 
-    if (!tuh_hid_receive_report(dev_addr, instance)) {
-        printf(" ERROR: Could not register for HID(%d,%d,%s)!\n", dev_addr, instance, hidprotostr);
-    } else {
-        printf(" HID(%d,%d,%s) registered for reports\n", dev_addr, instance, hidprotostr);
-
+    if (tuh_hid_receive_report(dev_addr, instance)) {
         if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
             hid_info[instance].leds = false;
             hid_info[instance].is_mouse = true;
+            ms_connected_count++;
         } else {
             hid_info[instance].dev_addr = dev_addr;
             hid_info[instance].modifiers = 0;
@@ -391,17 +386,23 @@ void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_
             memset(hid_info[instance].nkro, 0, MAX_NKRO);
             hid_info[instance].leds = true;
             hid_info[instance].is_mouse = false;
+            kb_connected_count++;
         }
-
-        board_led_write(1);
+        led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
     }
 }
 
 void tuh_hid_umount_cb(u8 dev_addr, u8 instance) {
-    printf("HID(%d,%d) unmounted\n", dev_addr, instance);
+    (void)dev_addr;
+    if (hid_info[instance].is_mouse) {
+        if (ms_connected_count > 0) ms_connected_count--;
+    } else if (hid_info[instance].leds) {
+        if (kb_connected_count > 0) kb_connected_count--;
+    }
     hid_info[instance].dev_addr = 0;
     hid_info[instance].leds = false;
     hid_info[instance].is_mouse = false;
+    led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
 }
 
 void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 len) {
@@ -428,31 +429,33 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
         return;
     }
     
-    board_led_write(1);
     tuh_hid_receive_report(dev_addr, instance);
 
     // Handle mouse reports
     if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_MOUSE) {
         if (tuh_hid_get_protocol(dev_addr, instance) == HID_PROTOCOL_BOOT) {
-            // Boot protocol mouse
+            // Boot protocol mouse - blink on button press only
+            static u8 prev_buttons = 0;
+            if (report[0] != prev_buttons) {
+                led_blink_activity();
+                prev_buttons = report[0];
+            }
             ps2_mouse_send_movement(report[0], report[1], report[2], len > 3 ? report[3] : 0);
         } else if (rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP && rpt_info->usage == HID_USAGE_DESKTOP_MOUSE) {
             ms_setup(rpt_info);
             ms_report_receive(report, len);
-        } else {
-            printf("UNKNOWN mouse  usage_page: %02x  usage: %02x\n", rpt_info->usage_page, rpt_info->usage);
         }
         return;
     }
 
     // Handle keyboard reports
     if (rpt_info->usage_page != HID_USAGE_PAGE_DESKTOP || rpt_info->usage != HID_USAGE_DESKTOP_KEYBOARD) {
-        printf("UNKNOWN key  usage_page: %02x  usage: %02x\n", rpt_info->usage_page, rpt_info->usage);
         return;
     }
 
     // Process modifier changes
     if (report[0] != hid_info[instance].modifiers) {
+        led_blink_activity();
         for (u8 i = 0; i < 8; i++) {
             if ((report[0] >> i & 1) != (hid_info[instance].modifiers >> i & 1)) {
                 ps2_keyboard_send_key(i + HID_KEY_CONTROL_LEFT, report[0] >> i & 1);
@@ -466,13 +469,16 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
 
     // NKRO handling (len > 12 and < 31)
     if (len > 12 && len < 31) {
+        bool key_changed = false;
         for (u8 i = 0; i < len && i < MAX_NKRO; i++) {
             for (u8 j = 0; j < 8; j++) {
                 if ((report[i] >> j & 1) != (hid_info[instance].nkro[i] >> j & 1)) {
+                    key_changed = true;
                     ps2_keyboard_send_key(i * 8 + j, report[i] >> j & 1);
                 }
             }
         }
+        if (key_changed) led_blink_activity();
         memcpy(hid_info[instance].nkro, report, len > MAX_NKRO ? MAX_NKRO : len);
         return;
     }
@@ -483,7 +489,8 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
         case 7:
             report++;
             // fall through
-        case 6:
+        case 6: {
+            bool key_changed = false;
             // Check for released keys
             for (u8 i = 0; i < MAX_BOOT; i++) {
                 if (hid_info[instance].boot[i]) {
@@ -494,7 +501,10 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
                             break;
                         }
                     }
-                    if (brk) ps2_keyboard_send_key(hid_info[instance].boot[i], false);
+                    if (brk) {
+                        key_changed = true;
+                        ps2_keyboard_send_key(hid_info[instance].boot[i], false);
+                    }
                 }
             }
 
@@ -508,15 +518,18 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
                             break;
                         }
                     }
-                    if (make) ps2_keyboard_send_key(report[i], true);
+                    if (make) {
+                        key_changed = true;
+                        ps2_keyboard_send_key(report[i], true);
+                    }
                 }
             }
 
+            if (key_changed) led_blink_activity();
             memcpy(hid_info[instance].boot, report, MAX_BOOT);
             return;
+        }
     }
-
-    printf("UNKNOWN keyboard  len: %d\n", len);
 }
 
 //--------------------------------------------------------------------
@@ -529,27 +542,15 @@ int main() {
     
     // Initialize board
     board_init();
-    board_led_write(1);
     
-    // Initialize stdio for USB serial debug
-    stdio_init_all();
-    
-    // Wait a bit for USB serial to enumerate
-    sleep_ms(1000);
-    
-    printf("\n=================================\n");
-    printf("USB to PS/2 Keyboard & Mouse\n");
-    printf("=================================\n");
+    // Initialize LED driver
+    led_init();
     
     // Initialize PS/2 keyboard emulation
     ps2_keyboard_init();
     
     // Initialize PS/2 mouse emulation
     ps2_mouse_init();
-    
-    printf("USB0: D+=GPIO%d, D-=GPIO%d\n", USB0_DP_PIN, USB0_DP_PIN + 1);
-    printf("USB1: D+=GPIO%d, D-=GPIO%d\n", USB1_DP_PIN, USB1_DP_PIN + 1);
-    printf("\n");
 
     // Configure and initialize PIO-USB host
     tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
@@ -562,17 +563,14 @@ int main() {
     
     // Add USB port 1 (GPIO 4/5) as additional root port
     // This shares the PIO state machines with port 0
-    if (pio_usb_host_add_port(USB1_DP_PIN, PIO_USB_PINOUT_DPDM) != 0) {
-        printf("Warning: Failed to add USB port 1\n");
-    }
-    
-    printf("Dual PIO-USB Host started\n");
+    pio_usb_host_add_port(USB1_DP_PIN, PIO_USB_PINOUT_DPDM);
     
     // Main loop
     while (true) {
         tuh_task();
         ps2_keyboard_task();
         ps2_mouse_task();
+        led_task();
     }
 
     return 0;

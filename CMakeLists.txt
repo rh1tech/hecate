@@ -8,6 +8,9 @@ project(hecate C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# Option for RP2040-Zero with WS2812 RGB LED
+option(USE_WS2812 "Use WS2812 RGB LED (RP2040-Zero)" OFF)
+
 # Initialize the Raspberry Pi Pico SDK
 pico_sdk_init()
 
@@ -20,6 +23,7 @@ add_executable(hecate
     src/ps2out.c
     src/ps2_keyboard.c
     src/ps2_mouse.c
+    src/led.c
 )
 
 # Generate PIO headers
@@ -29,6 +33,14 @@ pico_generate_pio_header(hecate ${CMAKE_CURRENT_LIST_DIR}/src/ps2out.pio)
 target_include_directories(hecate PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
 )
+
+# Compile definitions for LED type
+if(USE_WS2812)
+    target_compile_definitions(hecate PRIVATE USE_WS2812=1)
+    message(STATUS "Building with WS2812 RGB LED support (RP2040-Zero)")
+else()
+    message(STATUS "Building with standard GPIO LED (Raspberry Pi Pico)")
+endif()
 
 # Link libraries
 target_link_libraries(hecate
@@ -40,9 +52,9 @@ target_link_libraries(hecate
     pico_pio_usb
 )
 
-# Disable USB serial (conflicts with TinyUSB host), enable UART
+# Disable stdio (no debug output needed)
 pico_enable_stdio_usb(hecate 0)
-pico_enable_stdio_uart(hecate 1)
+pico_enable_stdio_uart(hecate 0)
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(hecate)

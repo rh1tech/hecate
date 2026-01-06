@@ -17,7 +17,6 @@
  */
 
 #include "ps2out.h"
-#include "bsp/board_api.h"
 #include "ps2out.pio.h"
 
 static s8 ps2out_prg = -1;
@@ -32,7 +31,6 @@ static u32 ps2_frame(u8 byte) {
 
 void ps2out_send(ps2out* this, u8 len) {
     this->packet[0] = len;
-    board_led_write(1);
     queue_try_add(&this->packets, &this->packet);
 }
 
@@ -81,7 +79,6 @@ void ps2out_task(ps2out* this) {
         if (this->sent == packet[0]) {
             queue_try_remove(&this->packets, &packet);
             this->sent = 0;
-            board_led_write(0);
         } else {
             this->sent++;
             this->last_tx = packet[this->sent];

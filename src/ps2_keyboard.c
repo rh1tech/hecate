@@ -18,7 +18,6 @@
 
 #include "ps2_keyboard.h"
 #include "tusb.h"
-#include <stdio.h>
 
 static ps2out kb_out;
 
@@ -119,8 +118,6 @@ static s64 kb_repeat_callback(alarm_id_t id, void *user_data) {
 }
 
 static void kb_receive(u8 byte, u8 prev_byte) {
-    printf("KB RX: 0x%02x (prev: 0x%02x)\n", byte, prev_byte);
-    
     switch (prev_byte) {
         case 0xed: // Set LEDs
             kb_set_leds_internal(byte);
@@ -138,7 +135,6 @@ static void kb_receive(u8 byte, u8 prev_byte) {
         default:
             switch (byte) {
                 case 0xff: // Reset
-                    printf("KB: Reset received, disabling\n");
                     kb_enabled = false;
                     kb_repeat_us = 91743;
                     kb_delay_ms = 500;
@@ -165,12 +161,10 @@ static void kb_receive(u8 byte, u8 prev_byte) {
                     return;
 
                 case 0xf4: // Enable scanning
-                    printf("KB: Scanning enabled\n");
                     kb_enabled = true;
                     break;
 
                 case 0xf5: // Disable scanning, restore default parameters
-                    printf("KB: Disabled (0xF5)\n");
                     kb_enabled = false;
                     kb_repeat_us = 91743;
                     kb_delay_ms = 500;
@@ -178,7 +172,6 @@ static void kb_receive(u8 byte, u8 prev_byte) {
                     break;
 
                 case 0xf6: // Set default parameters (keep scanning enabled)
-                    printf("KB: Set defaults (0xF6)\n");
                     kb_repeat_us = 91743;
                     kb_delay_ms = 500;
                     kb_set_leds_internal(0);
@@ -186,7 +179,6 @@ static void kb_receive(u8 byte, u8 prev_byte) {
                     break;
 
                 default:
-                    printf("KB: Unknown command 0x%02x\n", byte);
                     break;
             }
             break;
@@ -212,7 +204,6 @@ void ps2_keyboard_send_key(u8 key, bool state) {
     u8 len = 0;
 
     if (!kb_enabled) {
-        printf("KB: disabled\n");
         return;
     }
 
@@ -299,7 +290,4 @@ void ps2_keyboard_init(void) {
     
     // Send self-test passed
     add_alarm_in_ms(500, kb_reset_callback, NULL, false);
-    
-    printf("PS/2 Keyboard initialized: DATA=GPIO%d, CLK=GPIO%d\n", 
-           PS2_KB_DATA_PIN, PS2_KB_CLK_PIN);
 }
