@@ -374,6 +374,11 @@ void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_
 
     hid_info[instance].report_count = hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
 
+    // Force boot protocol for mice - more reliable than HID descriptor parsing
+    if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
+        tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT);
+    }
+
     if (tuh_hid_receive_report(dev_addr, instance)) {
         if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
             hid_info[instance].leds = false;

@@ -23,17 +23,21 @@ static ps2out ms_out;
 
 static bool ms_streaming = false;
 static bool ms_ismoving = false;
+static bool ms_buttons_changed = false;  // Track button state changes
 static u32 ms_magic_seq = 0;
 static u8 ms_type = 0;      // 0=standard, 3=IntelliMouse, 4=IntelliMouse Explorer
 static u8 ms_rate = MS_RATE_DEFAULT;
 static u8 ms_db = 0;        // button state
+static u8 ms_db_prev = 0;   // previous button state for change detection
 static s16 ms_dx = 0;       // accumulated X movement
 static s16 ms_dy = 0;       // accumulated Y movement
 static s8 ms_dz = 0;        // accumulated wheel movement
 
 static void ms_reset(void) {
     ms_ismoving = false;
+    ms_buttons_changed = false;
     ms_db = 0;
+    ms_db_prev = 0;
     ms_dx = 0;
     ms_dy = 0;
     ms_dz = 0;
@@ -63,15 +67,19 @@ static s16 ms_remain_xyz(s16 xyz) {
 static s64 ms_send_callback(alarm_id_t id, void *user_data) {
     (void)id;
     (void)user_data;
-    
+
     if (!ms_streaming) return 0;
     if (ps2out_is_busy()) return 1000000 / ms_rate;
 
-    if (!ms_db && !ms_dx && !ms_dy && !ms_dz) {
+    // Always send when buttons changed, even if no movement
+    bool has_data = ms_dx || ms_dy || ms_dz || ms_db || ms_buttons_changed;
+
+    if (!has_data) {
         if (!ms_ismoving) return 1000000 / ms_rate;
         ms_ismoving = false;
     } else {
         ms_ismoving = true;
+        ms_buttons_changed = false;  // Clear flag after we commit to send
     }
 
     u8 byte1 = 0x08 | (ms_db & 0x07);
@@ -110,6 +118,12 @@ static s64 ms_send_callback(alarm_id_t id, void *user_data) {
 }
 
 void ps2_mouse_send_movement(u8 buttons, s8 x, s8 y, s8 wheel) {
+    // Track button state changes to ensure clicks aren't lost
+    // even when USB reports faster than PS/2 sample rate
+    if (buttons != ms_db_prev) {
+        ms_buttons_changed = true;
+        ms_db_prev = buttons;
+    }
     ms_db = buttons;
     ms_dx += x;
     ms_dy += y;

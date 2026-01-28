@@ -12,21 +12,29 @@
 
 #include "led.h"
 #include "pico/stdlib.h"
+#include "pico/sync.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/gpio.h"
 
-// WS2812 LED pin for RP2040-Zero
+// WS2812 LED pin for RP2040-Zero / RP2350-Zero
+// Both boards have WS2812 RGB LED on GPIO16
 #ifndef WS2812_PIN
-// Check if this is an RP2040-Zero by looking for typical pin
-// RP2040-Zero has WS2812 on GPIO16
 #if defined(PICO_DEFAULT_WS2812_PIN)
 #define WS2812_PIN PICO_DEFAULT_WS2812_PIN
+#elif USE_WS2812
+// Default WS2812 pin for RP2040-Zero/RP2350-Zero when board doesn't define it
+#define WS2812_PIN 16
+#endif
+#endif
+
+// Ensure USE_WS2812 is defined
+#ifndef USE_WS2812
+#if defined(WS2812_PIN)
 #define USE_WS2812 1
 #else
 #define USE_WS2812 0
 #endif
-#else
-#define USE_WS2812 1
 #endif
 
 // Standard LED pin for Pico
@@ -46,11 +54,19 @@ static uint32_t led_blink_until = 0;
 #if USE_WS2812
 
 // Simple WS2812 driver using bit-banging
-// Timing: T0H=0.4us, T1H=0.8us, T0L=0.85us, T1L=0.45us
-// At 125MHz, 1 cycle = 8ns
+// WS2812 timing requirements:
+//   T1H: 0.7us (±150ns)  - High time for '1' bit
+//   T1L: 0.6us (±150ns)  - Low time for '1' bit
+//   T0H: 0.35us (±150ns) - High time for '0' bit
+//   T0L: 0.8us (±150ns)  - Low time for '0' bit
+//
+// At 120MHz (set in main.c), 1 cycle = 8.33ns
+// T1H: 0.7us = 84 cycles, T1L: 0.6us = 72 cycles
+// T0H: 0.35us = 42 cycles, T0L: 0.8us = 96 cycles
 
 static inline void ws2812_send_bit(uint pin, bool bit) {
     if (bit) {
+        // T1H: ~0.7us (84 NOPs at 120MHz)
         gpio_put(pin, 1);
         __asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
@@ -59,18 +75,27 @@ static inline void ws2812_send_bit(uint pin, bool bit) {
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
-                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop;");
+        // T1L: ~0.6us (72 NOPs at 120MHz)
         gpio_put(pin, 0);
         __asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
-                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop;");
     } else {
+        // T0H: ~0.35us (42 NOPs at 120MHz)
         gpio_put(pin, 1);
         __asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
-                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop;");
+        // T0L: ~0.8us (96 NOPs at 120MHz)
         gpio_put(pin, 0);
         __asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
@@ -79,7 +104,9 @@ static inline void ws2812_send_bit(uint pin, bool bit) {
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
                         "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
-                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;"
+                        "nop; nop; nop; nop; nop; nop;");
     }
 }
 
@@ -104,8 +131,9 @@ void led_init(void) {
 #if USE_WS2812
     gpio_init(WS2812_PIN);
     gpio_set_dir(WS2812_PIN, GPIO_OUT);
+    gpio_set_drive_strength(WS2812_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(WS2812_PIN, 0);
-    sleep_us(100); // Reset
+    sleep_us(300); // WS2812 reset pulse (>280us required)
     ws2812_set_color(0, 0, 0); // Off initially
 #else
     gpio_init(LED_PIN);

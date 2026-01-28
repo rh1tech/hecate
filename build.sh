@@ -6,8 +6,8 @@ set -e
 mkdir -p build
 cd build
 
-# Configure and build
-cmake ..
+# Configure and build with WS2812 RGB LED support (RP2040-Zero)
+cmake -DUSE_WS2812=ON ..
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 echo ""
