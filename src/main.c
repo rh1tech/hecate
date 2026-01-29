@@ -328,10 +328,12 @@ static void ms_report_receive(u8 const* report, u16 len) {
     y = to_signed_value8(ms_items.y, report, len);
     z = to_signed_value8(ms_items.z, report, len);
 
-    // Blink LED on button press/release (not movement)
+    // Blink LED on button press/release (blue) or movement (yellow)
     if (buttons != prev_buttons) {
-        led_blink_activity();
+        led_blink_mouse_button();
         prev_buttons = buttons;
+    } else if (x || y || z) {
+        led_blink_mouse_move();
     }
 
     ps2_mouse_send_movement(buttons, x, y, z);
@@ -439,11 +441,13 @@ void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 
     // Handle mouse reports
     if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_MOUSE) {
         if (tuh_hid_get_protocol(dev_addr, instance) == HID_PROTOCOL_BOOT) {
-            // Boot protocol mouse - blink on button press only
+            // Boot protocol mouse - blink blue on button, yellow on movement
             static u8 prev_buttons = 0;
             if (report[0] != prev_buttons) {
-                led_blink_activity();
+                led_blink_mouse_button();
                 prev_buttons = report[0];
+            } else if (report[1] || report[2] || (len > 3 && report[3])) {
+                led_blink_mouse_move();
             }
             ps2_mouse_send_movement(report[0], report[1], report[2], len > 3 ? report[3] : 0);
         } else if (rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP && rpt_info->usage == HID_USAGE_DESKTOP_MOUSE) {
@@ -559,17 +563,29 @@ int main() {
 
     // Configure and initialize PIO-USB host
     tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
-    
+
     // Configure USB port 0 (GPIO 2/3)
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp = USB0_DP_PIN;
     tuh_configure(0, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
     tuh_init(0);
-    
+
+    // Run a few USB task cycles to let port 0 stabilize
+    for (int i = 0; i < 100; i++) {
+        tuh_task();
+        sleep_ms(1);
+    }
+
     // Add USB port 1 (GPIO 4/5) as additional root port
     // This shares the PIO state machines with port 0
     pio_usb_host_add_port(USB1_DP_PIN, PIO_USB_PINOUT_DPDM);
-    
+
+    // Allow port 1 to enumerate connected devices
+    for (int i = 0; i < 100; i++) {
+        tuh_task();
+        sleep_ms(1);
+    }
+
     // Main loop
     while (true) {
         tuh_task();

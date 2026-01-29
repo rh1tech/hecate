@@ -18,8 +18,17 @@ void led_init(void);
 // Set connection state (LED on when connected)
 void led_set_connected(bool keyboard, bool mouse);
 
-// Trigger activity blink (keypress or mouse button)
+// Trigger activity blink (keypress) - blue
 void led_blink_activity(void);
+
+// Trigger mouse button blink - blue
+void led_blink_mouse_button(void);
+
+// Trigger mouse movement blink - yellow
+void led_blink_mouse_move(void);
+
+// Debug: PS/2 mouse packet sent - purple
+void led_blink_ps2_send(void);
 
 // Call periodically from main loop
 void led_task(void);

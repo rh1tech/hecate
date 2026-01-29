@@ -30,6 +30,7 @@ typedef void (*rx_callback)(u8 byte, u8 prev_byte);
 typedef struct {
     u8 sm;              // Single state machine for TX and RX
     u8 data_pin;
+    u8 clk_pin;
     queue_t packets;
     u8 packet[9];
     rx_callback rx_function;
@@ -40,9 +41,12 @@ typedef struct {
 } ps2out;
 
 // Initialize PS/2 output
-// sm: State machine number (0 for keyboard, 1 for mouse)
+// sm: State machine number (0 for keyboard, 2 for mouse)
 // data_pin: GPIO for data line (clock is data_pin + 1)
 void ps2out_init(ps2out* this, u8 sm, u8 data_pin, rx_callback rx_function);
+
+// Extended init with explicit clock pin
+void ps2out_init_ex(ps2out* this, u8 sm, u8 data_pin, u8 clk_pin, rx_callback rx_function);
 
 // Process PS/2 tasks (send queued data, receive host commands)
 void ps2out_task(ps2out* this);

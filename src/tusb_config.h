@@ -9,7 +9,7 @@
 #define CFG_TUSB_OS                 OPT_OS_PICO
 #define CFG_TUSB_DEBUG              0
 
-// Enable Host mode
+// Enable Host mode (PIO-USB for HID)
 #define CFG_TUH_ENABLED             1
 
 //--------------------------------------------------------------------
@@ -21,21 +21,17 @@
 
 #define CFG_TUH_RPI_PIO_USB         1
 
-// Single RHPort mode - second port added via pio_usb_host_add_port()
+// PIO-USB uses rhport 0 internally
 #define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
 
 #ifndef BOARD_TUH_RHPORT
 #define BOARD_TUH_RHPORT            0
 #endif
 
-#ifndef BOARD_TUH_MAX_SPEED
-#define BOARD_TUH_MAX_SPEED         OPT_MODE_FULL_SPEED
-#endif
-
-#define CFG_TUH_MAX_SPEED           BOARD_TUH_MAX_SPEED
+#define CFG_TUH_MAX_SPEED           OPT_MODE_FULL_SPEED
 
 //--------------------------------------------------------------------
-// Driver Configuration
+// Host Driver Configuration
 //--------------------------------------------------------------------
 
 // Hub support (for keyboards/mice connected via hub)

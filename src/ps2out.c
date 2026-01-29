@@ -18,6 +18,7 @@
 
 #include "ps2out.h"
 #include "ps2out.pio.h"
+#include <stdio.h>
 
 static s8 ps2out_prg = -1;
 
@@ -35,8 +36,13 @@ void ps2out_send(ps2out* this, u8 len) {
 }
 
 void ps2out_init(ps2out* this, u8 sm, u8 data_pin, rx_callback rx_function) {
+    ps2out_init_ex(this, sm, data_pin, data_pin + 1, rx_function);
+}
+
+void ps2out_init_ex(ps2out* this, u8 sm, u8 data_pin, u8 clk_pin, rx_callback rx_function) {
     this->sm = sm;
     this->data_pin = data_pin;
+    this->clk_pin = clk_pin;
     this->rx_function = rx_function;
     this->last_rx = 0;
     this->last_tx = 0;
@@ -50,12 +56,13 @@ void ps2out_init(ps2out* this, u8 sm, u8 data_pin, rx_callback rx_function) {
         ps2out_prg = pio_add_program(pio1, &ps2out_program);
     }
 
-    ps2out_program_init(pio1, sm, ps2out_prg, data_pin);
+    ps2out_program_init_ex(pio1, sm, ps2out_prg, data_pin, clk_pin);
 }
 
 bool ps2out_is_busy(void) {
     // Check if any state machine has its busy flag set
-    return pio_interrupt_get(pio1, 0) || pio_interrupt_get(pio1, 1);
+    // SM 0 = keyboard, SM 2 = mouse
+    return pio_interrupt_get(pio1, 0) || pio_interrupt_get(pio1, 2);
 }
 
 void ps2out_task(ps2out* this) {
@@ -72,8 +79,8 @@ void ps2out_task(ps2out* this) {
     }
 
     // Check if we can send: not busy, both lines high, and have data to send
-    if (!this->busy && !is_busy && 
-        gpio_get(this->data_pin) && gpio_get(this->data_pin + 1) && 
+    if (!this->busy && !is_busy &&
+        gpio_get(this->data_pin) && gpio_get(this->clk_pin) &&
         queue_try_peek(&this->packets, &packet)) {
         
         if (this->sent == packet[0]) {
@@ -96,7 +103,8 @@ void ps2out_task(ps2out* this) {
 
     // Check for received data from host
     if (!pio_sm_is_rx_fifo_empty(pio1, this->sm)) {
-        u32 fifo = pio_sm_get(pio1, this->sm) >> 23;
+        u32 raw_fifo = pio_sm_get(pio1, this->sm);
+        u32 fifo = raw_fifo >> 23;
 
         // Verify parity
         bool parity = 1;
@@ -106,6 +114,7 @@ void ps2out_task(ps2out* this) {
 
         if (parity != (fifo >> 8)) {
             // Parity error, request resend
+            printf("PIO SM%d parity error fifo=0x%03lX\n", this->sm, (unsigned long)fifo);
             pio_sm_put(pio1, this->sm, ps2_frame(0xfe));
             return;
         }

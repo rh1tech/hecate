@@ -79,12 +79,15 @@ sendcontinue:
 
 % c-sdk {
 
-static inline void ps2out_program_init(PIO pio, uint sm, uint offset, uint dat) {
+static inline void ps2out_program_init_ex(PIO pio, uint sm, uint offset, uint dat, uint clk) {
     pio_sm_config c = ps2out_program_get_default_config(offset);
-    
-    uint clk = dat + 1;
+
     pio_gpio_init(pio, clk);
     pio_gpio_init(pio, dat);
+
+    // PS/2 is open-drain, needs pull-ups
+    gpio_pull_up(clk);
+    gpio_pull_up(dat);
     
     // Use a frequency high enough to effectively sample clock and data
     // 125MHz / 320 = 390.625kHz = 2.56µs per instruction
@@ -100,6 +103,10 @@ static inline void ps2out_program_init(PIO pio, uint sm, uint offset, uint dat) 
     
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void ps2out_program_init(PIO pio, uint sm, uint offset, uint dat) {
+    ps2out_program_init_ex(pio, sm, offset, dat, dat + 1);
 }
 
 %}

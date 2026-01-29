@@ -16,12 +16,16 @@
  */
 
 #include "ps2_mouse.h"
+#include "pico/stdlib.h"
+#include "led.h"
+#include <stdio.h>
 
 static ps2out ms_out;
 
 #define MS_RATE_DEFAULT 100
 
 static bool ms_streaming = false;
+static bool ms_remote = false;           // Remote mode (send on 0xEB only)
 static bool ms_ismoving = false;
 static bool ms_buttons_changed = false;  // Track button state changes
 static u32 ms_magic_seq = 0;
@@ -46,6 +50,7 @@ static void ms_reset(void) {
 static s64 ms_reset_callback(alarm_id_t id, void *user_data) {
     (void)id;
     (void)user_data;
+    printf("MS: Sending BAT 0xAA, type=%d\n", ms_type);
     ms_out.packet[1] = 0xaa;
     ms_out.packet[2] = ms_type;
     ps2out_send(&ms_out, 2);
@@ -62,6 +67,43 @@ static s16 ms_remain_xyz(s16 xyz) {
     if (xyz < -255) return xyz + 255;
     if (xyz > 255) return xyz - 255;
     return 0;
+}
+
+// Build and send a movement packet immediately (for Remote Mode 0xEB response)
+static void ms_send_packet_now(void) {
+    u8 byte1 = 0x08 | (ms_db & 0x07);
+    u8 byte2 = ms_clamp_xyz(ms_dx);
+    u8 byte3 = 0x100 - ms_clamp_xyz(ms_dy);
+    s8 byte4 = 0x100 - ms_dz;
+
+    if (ms_dx < 0) byte1 |= 0x10;
+    if (ms_dy > 0) byte1 |= 0x20;
+    if (byte2 == 0xaa) byte2 = 0xab;
+    if (byte3 == 0xaa) byte3 = 0xab;
+
+    u8 len = 0;
+    ms_out.packet[++len] = byte1;
+    ms_out.packet[++len] = byte2;
+    ms_out.packet[++len] = byte3;
+
+    if (ms_type == 3 || ms_type == 4) {
+        if (byte4 < -8) byte4 = -8;
+        if (byte4 > 7) byte4 = 7;
+
+        if (ms_type == 4) {
+            byte4 &= 0x0f;
+            byte4 |= (ms_db << 1) & 0x30;
+        }
+
+        ms_out.packet[++len] = byte4;
+    }
+
+    ms_dx = ms_remain_xyz(ms_dx);
+    ms_dy = ms_remain_xyz(ms_dy);
+    ms_dz = 0;
+    ms_buttons_changed = false;
+    ps2out_send(&ms_out, len);
+    led_blink_ps2_send();
 }
 
 static s64 ms_send_callback(alarm_id_t id, void *user_data) {
@@ -132,6 +174,9 @@ void ps2_mouse_send_movement(u8 buttons, s8 x, s8 y, s8 wheel) {
 
 static void ms_receive(u8 byte, u8 prev_byte) {
     switch (prev_byte) {
+        case 0xe8: // Set Resolution - data byte (ignored, just ACK)
+            break;
+
         case 0xf3: // Set Sample Rate
             ms_rate = byte;
 
@@ -155,16 +200,33 @@ static void ms_receive(u8 byte, u8 prev_byte) {
                     // fall through
                 case 0xf6: // Set Defaults
                     ms_rate = MS_RATE_DEFAULT;
+                    ms_remote = false;
                     // fall through
                 case 0xf5: // Disable Data Reporting
                     ms_streaming = false;
                     ms_reset();
                     break;
 
-                case 0xf4: // Enable Data Reporting
+                case 0xf4: // Enable Data Reporting (Stream Mode)
+                    printf("MS: Stream Mode ENABLED\n");
                     ms_streaming = true;
+                    ms_remote = false;
                     ms_reset();
                     add_alarm_in_ms(100, ms_send_callback, NULL, false);
+                    break;
+
+                case 0xf0: // Set Remote Mode
+                    printf("MS: Remote Mode ENABLED\n");
+                    ms_streaming = false;
+                    ms_remote = true;
+                    ms_reset();
+                    break;
+
+                case 0xf3: // Set Sample Rate (command byte, data handled in outer switch)
+                case 0xe8: // Set Resolution (command byte)
+                case 0xe6: // Set Scaling 1:1
+                case 0xe7: // Set Scaling 2:1
+                    // These commands just need ACK, data byte handled separately
                     break;
 
                 case 0xf2: // Get Device ID
@@ -174,13 +236,17 @@ static void ms_receive(u8 byte, u8 prev_byte) {
                     ms_reset();
                     return;
 
-                case 0xeb: // Read Data
-                    ms_ismoving = true;
-                    break;
+                case 0xeb: // Read Data (used in Remote Mode, returns ACK + data packet)
+                    // Send ACK first, then data packet
+                    ms_out.packet[1] = 0xfa;
+                    ps2out_send(&ms_out, 1);
+                    // Then send the movement packet
+                    ms_send_packet_now();
+                    return;
 
                 case 0xe9: // Status Request
                     ms_out.packet[1] = 0xfa;
-                    ms_out.packet[2] = ms_streaming << 5;
+                    ms_out.packet[2] = (ms_streaming << 5) | (ms_remote << 6);
                     ms_out.packet[3] = 0x02; // Resolution
                     ms_out.packet[4] = ms_rate;
                     ps2out_send(&ms_out, 4);
@@ -198,14 +264,66 @@ static void ms_receive(u8 byte, u8 prev_byte) {
     ps2out_send(&ms_out, 1);
 }
 
+static void ms_try_send(void) {
+    if (!ms_streaming) {
+        return;
+    }
+
+    // Check if there's data to send
+    bool has_data = ms_dx || ms_dy || ms_dz || ms_db || ms_buttons_changed;
+
+    if (!has_data) {
+        if (!ms_ismoving) return;
+        ms_ismoving = false;
+    } else {
+        ms_ismoving = true;
+        ms_buttons_changed = false;
+    }
+
+    u8 byte1 = 0x08 | (ms_db & 0x07);
+    u8 byte2 = ms_clamp_xyz(ms_dx);
+    u8 byte3 = 0x100 - ms_clamp_xyz(ms_dy);
+    s8 byte4 = 0x100 - ms_dz;
+
+    if (ms_dx < 0) byte1 |= 0x10;
+    if (ms_dy > 0) byte1 |= 0x20;
+    if (byte2 == 0xaa) byte2 = 0xab;
+    if (byte3 == 0xaa) byte3 = 0xab;
+
+    u8 len = 0;
+    ms_out.packet[++len] = byte1;
+    ms_out.packet[++len] = byte2;
+    ms_out.packet[++len] = byte3;
+
+    if (ms_type == 3 || ms_type == 4) {
+        if (byte4 < -8) byte4 = -8;
+        if (byte4 > 7) byte4 = 7;
+
+        if (ms_type == 4) {
+            byte4 &= 0x0f;
+            byte4 |= (ms_db << 1) & 0x30;
+        }
+
+        ms_out.packet[++len] = byte4;
+    }
+
+    ms_dx = ms_remain_xyz(ms_dx);
+    ms_dy = ms_remain_xyz(ms_dy);
+    ms_dz = 0;
+    ps2out_send(&ms_out, len);
+    led_blink_ps2_send();  // Debug: purple blink when PS/2 packet queued
+}
+
 bool ps2_mouse_task(void) {
     ps2out_task(&ms_out);
+    ms_try_send();
     return ms_streaming && !ps2out_is_busy();
 }
 
 void ps2_mouse_init(void) {
-    // Use state machines 2 (TX) and 3 (RX) for mouse
-    // Keyboard uses state machines 0 and 1
+    // Use state machine 2 for mouse (keyboard uses SM 0)
     ps2out_init(&ms_out, 2, PS2_MOUSE_DATA_PIN, &ms_receive);
-    ms_reset_callback(0, NULL);
+
+    // Delay BAT completion to allow host to boot
+    add_alarm_in_ms(500, ms_reset_callback, NULL, false);
 }

@@ -52,9 +52,10 @@ target_link_libraries(hecate
     pico_pio_usb
 )
 
-# Disable stdio (no debug output needed)
+# Enable UART serial console (GPIO 0=TX, GPIO 1=RX)
+# Note: USB serial not possible when tinyusb_host is linked (SDK limitation)
 pico_enable_stdio_usb(hecate 0)
-pico_enable_stdio_uart(hecate 0)
+pico_enable_stdio_uart(hecate 1)
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(hecate)
