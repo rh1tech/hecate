@@ -13,8 +13,9 @@ Named after Hecate, the ancient Greek goddess of crossroads and liminal spaces. 
 ## Features
 
 ### USB Host
-- **Dual PIO-USB ports** - Connect keyboard and mouse directly without a hub
-- **USB hub support** - Or use a hub for multiple devices on one port
+- **Triple USB ports** - Native Type-C plus dual PIO-USB ports
+- **Hybrid USB mode** - Use Type-C and PIO-USB simultaneously
+- **USB hub support** - Connect multiple devices via hub on any port
 - **HID report parsing** - Supports both boot protocol and full HID report descriptors
 - **NKRO support** - N-Key Rollover for gaming keyboards
 
@@ -30,7 +31,8 @@ Named after Hecate, the ancient Greek goddess of crossroads and liminal spaces. 
 - **Standard 3-button mouse** - Left, right, middle buttons
 - **IntelliMouse** - Scroll wheel support (auto-detected)
 - **IntelliMouse Explorer** - 5-button support (auto-detected)
-- **Host commands** - Reset, Get ID, Enable/Disable streaming, Status request
+- **Stream and Remote modes** - Automatic mode detection
+- **Host commands** - Reset, Get ID, Enable/Disable streaming, Read Data, Status request
 
 ### Status LED
 - **Connection indicator** - LED on when keyboard or mouse is connected
@@ -42,14 +44,18 @@ Named after Hecate, the ancient Greek goddess of crossroads and liminal spaces. 
 
 | Function | GPIO | Description |
 |----------|------|-------------|
-| USB0 D+ | GPIO 2 | USB Port 0 Data+ |
-| USB0 D- | GPIO 3 | USB Port 0 Data- |
-| USB1 D+ | GPIO 4 | USB Port 1 Data+ |
-| USB1 D- | GPIO 5 | USB Port 1 Data- |
+| UART TX | GPIO 0 | Debug serial output |
+| UART RX | GPIO 1 | Debug serial input |
+| PIO-USB0 D+ | GPIO 2 | PIO-USB Port 0 Data+ |
+| PIO-USB0 D- | GPIO 3 | PIO-USB Port 0 Data- |
+| PIO-USB1 D+ | GPIO 4 | PIO-USB Port 1 Data+ |
+| PIO-USB1 D- | GPIO 5 | PIO-USB Port 1 Data- |
 | PS/2 KB DATA | GPIO 11 | Keyboard Data line |
 | PS/2 KB CLK | GPIO 12 | Keyboard Clock line |
 | PS/2 MS DATA | GPIO 14 | Mouse Data line |
 | PS/2 MS CLK | GPIO 15 | Mouse Clock line |
+| WS2812 LED | GPIO 16 | RGB LED (RP2040-Zero) |
+| Native USB | Type-C | Native USB host port |
 
 ## Supported Boards
 
@@ -95,6 +101,19 @@ Or use the included flash script:
 ```bash
 ./flash.sh
 ```
+
+### Release Build
+
+To create a release build with version tracking:
+```bash
+./release.sh
+```
+
+Release files are saved to the `releases/` directory with version numbering (e.g., `hecate_1_00.uf2`).
+
+## Debug Output
+
+UART serial console is available on GPIO 0 (TX) and GPIO 1 (RX) at 115200 baud. Connect a USB-to-serial adapter to view debug messages.
 
 ## Hardware Notes
 

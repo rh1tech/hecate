@@ -9,23 +9,35 @@
 #define CFG_TUSB_OS                 OPT_OS_PICO
 #define CFG_TUSB_DEBUG              0
 
-// Enable Host mode (PIO-USB for HID)
+// Enable Host mode
 #define CFG_TUH_ENABLED             1
 
 //--------------------------------------------------------------------
-// PIO-USB Configuration
-// Uses pio_usb_host_add_port() for dual USB ports on:
-// Port 0: GPIO 2 (D+) / GPIO 3 (D-)
-// Port 1: GPIO 4 (D+) / GPIO 5 (D-)
+// Hybrid USB Configuration
+//
+// Enables both native USB (Type-C) and PIO-USB simultaneously:
+//   rhport 0: Native RP2040 USB controller (Type-C port)
+//   rhport 1: PIO-USB port 0 (GPIO 2/3)
+//   rhport 2: PIO-USB port 1 (GPIO 4/5) - added via pio_usb_host_add_port
 //--------------------------------------------------------------------
 
-#define CFG_TUH_RPI_PIO_USB         1
+// Enable hybrid mode (native USB + PIO-USB)
+#ifndef CFG_TUH_RPI_HYBRID_USB
+#define CFG_TUH_RPI_HYBRID_USB      0
+#endif
 
-// PIO-USB uses rhport 0 internally
-#define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
-
-#ifndef BOARD_TUH_RHPORT
-#define BOARD_TUH_RHPORT            0
+#if CFG_TUH_RPI_HYBRID_USB
+    // Hybrid mode: Native USB on rhport 0, PIO-USB on rhport 1
+    // Note: CFG_TUH_RPI_PIO_USB is NOT defined here because our hybrid
+    // driver (hcd_hybrid.c) provides all HCD functions directly
+    #define CFG_TUSB_RHPORT0_MODE   (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
+    #define CFG_TUSB_RHPORT1_MODE   (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
+    #define BOARD_TUH_RHPORT        0
+#else
+    // PIO-USB only mode (original configuration)
+    #define CFG_TUH_RPI_PIO_USB     1
+    #define CFG_TUSB_RHPORT0_MODE   (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
+    #define BOARD_TUH_RHPORT        0
 #endif
 
 #define CFG_TUH_MAX_SPEED           OPT_MODE_FULL_SPEED

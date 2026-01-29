@@ -20,6 +20,9 @@ Makefile
 *.dis
 *.map
 
+# But keep release builds
+!releases/*.uf2
+
 # PIO generated headers
 *.pio.h
 

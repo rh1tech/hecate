@@ -17,7 +17,6 @@
 
 #include "ps2_mouse.h"
 #include "pico/stdlib.h"
-#include "led.h"
 #include <stdio.h>
 
 static ps2out ms_out;
@@ -103,7 +102,6 @@ static void ms_send_packet_now(void) {
     ms_dz = 0;
     ms_buttons_changed = false;
     ps2out_send(&ms_out, len);
-    led_blink_ps2_send();
 }
 
 static s64 ms_send_callback(alarm_id_t id, void *user_data) {
@@ -311,7 +309,6 @@ static void ms_try_send(void) {
     ms_dy = ms_remain_xyz(ms_dy);
     ms_dz = 0;
     ps2out_send(&ms_out, len);
-    led_blink_ps2_send();  // Debug: purple blink when PS/2 packet queued
 }
 
 bool ps2_mouse_task(void) {

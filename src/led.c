@@ -50,9 +50,6 @@
 static bool led_kb_connected = false;
 static bool led_ms_connected = false;
 static uint32_t led_blink_until = 0;
-static uint8_t led_blink_r = 0;
-static uint8_t led_blink_g = 0;
-static uint8_t led_blink_b = 32;
 
 #if USE_WS2812
 
@@ -151,45 +148,18 @@ void led_set_connected(bool keyboard, bool mouse) {
 }
 
 void led_blink_activity(void) {
-    // Blink blue for 50ms (keyboard)
+    // Blink blue for 50ms
     led_blink_until = time_us_32() + 50000;
-    led_blink_r = 0;
-    led_blink_g = 0;
-    led_blink_b = 32;
-}
-
-void led_blink_mouse_button(void) {
-    // Blink blue for 50ms (mouse button)
-    led_blink_until = time_us_32() + 50000;
-    led_blink_r = 0;
-    led_blink_g = 0;
-    led_blink_b = 32;
-}
-
-void led_blink_mouse_move(void) {
-    // Blink yellow for 50ms (mouse movement)
-    led_blink_until = time_us_32() + 50000;
-    led_blink_r = 32;
-    led_blink_g = 32;
-    led_blink_b = 0;
-}
-
-void led_blink_ps2_send(void) {
-    // Blink purple for 50ms (PS/2 packet sent)
-    led_blink_until = time_us_32() + 50000;
-    led_blink_r = 32;
-    led_blink_g = 0;
-    led_blink_b = 32;
 }
 
 void led_task(void) {
     bool connected = led_kb_connected || led_ms_connected;
     bool blinking = time_us_32() < led_blink_until;
-    
+
 #if USE_WS2812
-    // RGB LED: Green when connected, colored blink on activity, Off when disconnected
+    // RGB LED: Green when connected, blue blink on activity, off when disconnected
     if (blinking) {
-        ws2812_set_color(led_blink_r, led_blink_g, led_blink_b);
+        ws2812_set_color(0, 0, 32);  // Blue on keypress/button
     } else if (connected) {
         ws2812_set_color(0, 32, 0); // Green when connected
     } else {
