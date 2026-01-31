@@ -7,9 +7,12 @@
  *
  * Features:
  *   - Dual PIO-USB host ports (GPIO 2/3 and GPIO 4/5)
- *   - HID report descriptor parsing for non-boot protocol devices
+ *   - Native USB host port (Type-C) in hybrid mode
+ *   - HID report descriptor parsing using pico-hid-host library
  *   - NKRO (N-Key Rollover) keyboard support
  *   - IntelliMouse and IntelliMouse Explorer support
+ *   - USB gamepad/joystick support
+ *   - XInput (Xbox controller) support
  *   - USB hub support for connecting multiple devices
  *
  * SPDX-License-Identifier: MIT
@@ -25,6 +28,13 @@
 #include "pio_usb.h"
 #include "tusb.h"
 
+// HID Host parsing library
+#include "hid_rip.h"
+#include "hid_host_info.h"
+#include "hid_host_joy.h"
+#include "hid_host_mouse.h"
+#include "xinput_host.h"
+
 // Dual PIO-USB Host GPIO configuration
 // Port 0: GPIO 2 (D+) / GPIO 3 (D-)
 // Port 1: GPIO 4 (D+) / GPIO 5 (D-) - added via pio_usb_host_add_port
@@ -32,72 +42,31 @@
 #define USB1_DP_PIN 4
 
 //--------------------------------------------------------------------
-// HID Report Parsing Structures
+// HID Instance Tracking
 //--------------------------------------------------------------------
 
 #define MAX_BOOT 6
 #define MAX_NKRO 16
 #define MAX_REPORT 8
-#define MAX_REPORT_ITEMS 32
-
-typedef struct {
-    u16 page;
-    u16 usage;
-} hid_usage_t;
-
-typedef struct {
-    s32 min;
-    s32 max;
-} hid_minmax_t;
-
-typedef struct {
-    hid_usage_t usage;
-    hid_minmax_t logical;
-} hid_report_item_attributes_t;
-
-typedef struct {
-    u16 bit_offset;
-    u8 bit_size;
-    u8 item_type;
-    hid_report_item_attributes_t attributes;
-} hid_report_item_t;
-
-typedef struct {
-    u8 report_id;
-    u8 usage;
-    u16 usage_page;
-    u8 num_items;
-    hid_report_item_t item[MAX_REPORT_ITEMS];
-} hid_report_info_t;
-
-typedef struct {
-    const hid_report_item_t *x;
-    const hid_report_item_t *y;
-    const hid_report_item_t *z;
-    const hid_report_item_t *lb;
-    const hid_report_item_t *mb;
-    const hid_report_item_t *rb;
-    const hid_report_item_t *bw;
-    const hid_report_item_t *fw;
-} ms_items_t;
 
 typedef struct {
     u8 report_count;
-    hid_report_info_t report_info[MAX_REPORT];
+    tuh_hid_report_info_plus_t report_info[MAX_REPORT];
     u8 dev_addr;
     u8 modifiers;
     u8 boot[MAX_BOOT];
     u8 nkro[MAX_NKRO];
     bool leds;
     bool is_mouse;
+    bool is_joystick;
 } hid_instance_t;
 
 static hid_instance_t hid_info[CFG_TUH_HID];
-static ms_items_t ms_items;
 
 // Connection tracking for LED
 static u8 kb_connected_count = 0;
 static u8 ms_connected_count = 0;
+static u8 joy_connected_count = 0;
 
 // LED sync variables
 static u8 kb_inst_loop = 0;
@@ -105,236 +74,179 @@ static u8 kb_last_dev = 0;
 extern u8 kb_set_led;
 
 //--------------------------------------------------------------------
-// HID Report Descriptor Parsing
+// Keyboard Report Handling
 //--------------------------------------------------------------------
 
-static bool hid_parse_find_bit_item_by_page(hid_report_info_t* info, u8 type, u16 page, u8 bit, const hid_report_item_t **item) {
-    for (u8 i = 0; i < info->num_items; i++) {
-        if (info->item[i].item_type == type && info->item[i].attributes.usage.page == page) {
-            if (item) {
-                if (i + bit < info->num_items && info->item[i + bit].item_type == type && 
-                    info->item[i + bit].attributes.usage.page == page) {
-                    *item = &info->item[i + bit];
-                } else {
-                    return false;
+static void handle_keyboard_report(u8 instance, u8 const* report, u16 len) {
+    // Process modifier changes
+    if (report[0] != hid_info[instance].modifiers) {
+        led_blink_activity();
+        for (u8 i = 0; i < 8; i++) {
+            if ((report[0] >> i & 1) != (hid_info[instance].modifiers >> i & 1)) {
+                ps2_keyboard_send_key(i + HID_KEY_CONTROL_LEFT, report[0] >> i & 1);
+            }
+        }
+        hid_info[instance].modifiers = report[0];
+    }
+
+    const u8* keys = report + 1;
+    u16 keys_len = len - 1;
+
+    // Skip reserved byte if present (standard boot protocol has it)
+    if (keys_len >= 7) {
+        keys++;
+        keys_len--;
+    }
+
+    // NKRO handling (report length > 12 bytes, typically bitmap)
+    if (keys_len > 12 && keys_len < 31) {
+        bool key_changed = false;
+        for (u8 i = 0; i < keys_len && i < MAX_NKRO; i++) {
+            for (u8 j = 0; j < 8; j++) {
+                if ((keys[i] >> j & 1) != (hid_info[instance].nkro[i] >> j & 1)) {
+                    key_changed = true;
+                    ps2_keyboard_send_key(i * 8 + j, keys[i] >> j & 1);
                 }
             }
-            return true;
         }
+        if (key_changed) led_blink_activity();
+        memcpy(hid_info[instance].nkro, keys, keys_len > MAX_NKRO ? MAX_NKRO : keys_len);
+        return;
     }
-    return false;
-}
 
-static bool hid_parse_find_item_by_usage(hid_report_info_t* info, u8 type, u16 usage, const hid_report_item_t **item) {
-    for (u8 i = 0; i < info->num_items; i++) {
-        if (info->item[i].item_type == type && info->item[i].attributes.usage.usage == usage) {
-            if (item) {
-                *item = &info->item[i];
-            }
-            return true;
-        }
-    }
-    return false;
-}
+    // Boot protocol / 6KRO handling
+    if (keys_len >= 6) {
+        bool key_changed = false;
 
-static bool hid_parse_get_item_value(const hid_report_item_t *item, const u8 *report, u8 len, s32 *value) {
-    (void)len;
-    if (item == NULL || report == NULL) return false;
-    u8 boffs = item->bit_offset & 0x07;
-    u8 pos = 8 - boffs;
-    u8 offs = item->bit_offset >> 3;
-    u32 mask = ~(0xffffffff << item->bit_size);
-    s32 val = report[offs++] >> boffs;
-    while (item->bit_size > pos) {
-        val |= (report[offs++] << pos);
-        pos += 8;
-    }
-    val &= mask;
-    if (item->attributes.logical.min < 0) {
-        if (val & (1 << (item->bit_size - 1))) {
-            val |= (0xffffffff << item->bit_size);
-        }
-    }
-    *value = val;
-    return true;
-}
-
-static s8 to_signed_value8(const hid_report_item_t *item, const u8 *report, u16 len) {
-    s32 value = 0;
-    if (hid_parse_get_item_value(item, report, len, &value)) {
-        value = (value > 127) ? 127 : (value < -127) ? -127 : value;
-    }
-    return value;
-}
-
-static bool to_bit_value(const hid_report_item_t *item, const u8 *report, u16 len) {
-    s32 value = 0;
-    hid_parse_get_item_value(item, report, len, &value);
-    return value ? true : false;
-}
-
-static u8 hid_parse_report_descriptor(hid_report_info_t* report_info_arr, u8 arr_count, u8 const* desc_report, u16 desc_len) {
-    union __attribute__((packed)) {
-        u8 byte;
-        struct __attribute__((packed)) {
-            u8 size: 2;
-            u8 type: 2;
-            u8 tag: 4;
-        };
-    } header;
-
-    memset(report_info_arr, 0, arr_count * sizeof(hid_report_info_t));
-
-    u8 report_num = 0;
-    hid_report_info_t* info = report_info_arr;
-
-    u16 ri_global_usage_page = 0;
-    s32 ri_global_logical_min = 0;
-    s32 ri_global_logical_max = 0;
-    u8 ri_report_count = 0;
-    u8 ri_report_size = 0;
-    u8 ri_report_usage_count = 0;
-    u8 ri_collection_depth = 0;
-
-    while (desc_len && report_num < arr_count) {
-        header.byte = *desc_report++;
-        desc_len--;
-
-        u8 const tag = header.tag;
-        u8 const type = header.type;
-        u8 const size = header.size;
-
-        u32 data;
-        s32 sdata;
-        switch (size) {
-            case 1: data = desc_report[0]; sdata = ((data & 0x80) ? 0xffffff00 : 0) | data; break;
-            case 2: data = (desc_report[1] << 8) | desc_report[0]; sdata = ((data & 0x8000) ? 0xffff0000 : 0) | data; break;
-            case 3: data = (desc_report[3] << 24) | (desc_report[2] << 16) | (desc_report[1] << 8) | desc_report[0]; sdata = data; break;
-            default: data = 0; sdata = 0;
-        }
-
-        u16 offset;
-        switch (type) {
-            case 0: // Main
-                switch (tag) {
-                    case 8: // Input
-                    case 9: // Output
-                    case 11: // Feature
-                        offset = (info->num_items == 0) ? 0 : (info->item[info->num_items - 1].bit_offset + info->item[info->num_items - 1].bit_size);
-                        if (ri_report_usage_count > ri_report_count) {
-                            info->num_items += ri_report_usage_count - ri_report_count;
-                        }
-                        for (u8 i = 0; i < ri_report_count; i++) {
-                            if (info->num_items + i < MAX_REPORT_ITEMS) {
-                                info->item[info->num_items + i].bit_offset = offset;
-                                info->item[info->num_items + i].bit_size = ri_report_size;
-                                info->item[info->num_items + i].item_type = tag;
-                                info->item[info->num_items + i].attributes.logical.min = ri_global_logical_min;
-                                info->item[info->num_items + i].attributes.logical.max = ri_global_logical_max;
-                                info->item[info->num_items + i].attributes.usage.page = ri_global_usage_page;
-                                if (ri_report_usage_count != ri_report_count && ri_report_usage_count > 0) {
-                                    if (i >= ri_report_usage_count) {
-                                        info->item[info->num_items + i].attributes.usage = info->item[info->num_items + i - 1].attributes.usage;
-                                    }
-                                }
-                            }
-                            offset += ri_report_size;
-                        }
-                        info->num_items += ri_report_count;
-                        ri_report_usage_count = 0;
+        // Check for released keys
+        for (u8 i = 0; i < MAX_BOOT; i++) {
+            if (hid_info[instance].boot[i]) {
+                bool brk = true;
+                for (u8 j = 0; j < MAX_BOOT; j++) {
+                    if (hid_info[instance].boot[i] == keys[j]) {
+                        brk = false;
                         break;
-
-                    case 10: // Collection
-                        ri_report_usage_count = 0;
-                        ri_report_count = 0;
-                        ri_collection_depth++;
-                        break;
-
-                    case 12: // End Collection
-                        ri_collection_depth--;
-                        if (ri_collection_depth == 0) {
-                            info++;
-                            report_num++;
-                        }
-                        break;
-                }
-                break;
-
-            case 1: // Global
-                switch (tag) {
-                    case 0: // Usage Page
-                        if (ri_collection_depth == 0) {
-                            info->usage_page = data;
-                        }
-                        ri_global_usage_page = data;
-                        break;
-                    case 1: ri_global_logical_min = sdata; break;
-                    case 2: ri_global_logical_max = sdata; break;
-                    case 7: ri_report_size = data; break;
-                    case 8: info->report_id = data; break;
-                    case 9: ri_report_count = data; break;
-                }
-                break;
-
-            case 2: // Local
-                if (tag == 0) { // Usage
-                    if (ri_collection_depth == 0) {
-                        info->usage = data;
-                    } else {
-                        if (ri_report_usage_count < MAX_REPORT_ITEMS) {
-                            info->item[info->num_items + ri_report_usage_count].attributes.usage.usage = data;
-                            ri_report_usage_count++;
-                        }
                     }
                 }
-                break;
+                if (brk) {
+                    key_changed = true;
+                    ps2_keyboard_send_key(hid_info[instance].boot[i], false);
+                }
+            }
         }
 
-        desc_report += size;
-        desc_len -= size;
-    }
+        // Check for pressed keys
+        for (u8 i = 0; i < MAX_BOOT; i++) {
+            if (keys[i]) {
+                bool make = true;
+                for (u8 j = 0; j < MAX_BOOT; j++) {
+                    if (keys[i] == hid_info[instance].boot[j]) {
+                        make = false;
+                        break;
+                    }
+                }
+                if (make) {
+                    key_changed = true;
+                    ps2_keyboard_send_key(keys[i], true);
+                }
+            }
+        }
 
-    return report_num;
+        if (key_changed) led_blink_activity();
+        memcpy(hid_info[instance].boot, keys, MAX_BOOT);
+    }
 }
 
 //--------------------------------------------------------------------
 // Mouse Report Handling
 //--------------------------------------------------------------------
 
-static void ms_setup(hid_report_info_t *info) {
-    memset(&ms_items, 0, sizeof(ms_items_t));
-    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_X, &ms_items.x);
-    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_Y, &ms_items.y);
-    hid_parse_find_item_by_usage(info, 8, HID_USAGE_DESKTOP_WHEEL, &ms_items.z);
-    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 0, &ms_items.lb);
-    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 1, &ms_items.rb);
-    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 2, &ms_items.mb);
-    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 3, &ms_items.bw);
-    hid_parse_find_bit_item_by_page(info, 8, HID_USAGE_PAGE_BUTTON, 4, &ms_items.fw);
+static void handle_mouse_report_boot(u8 const* report, u16 len) {
+    static u8 prev_buttons = 0;
+
+    if (report[0] != prev_buttons) {
+        led_blink_activity();
+        prev_buttons = report[0];
+    }
+
+    ps2_mouse_send_movement(report[0], report[1], report[2], len > 3 ? report[3] : 0);
 }
 
-static void ms_report_receive(u8 const* report, u16 len) {
+static void handle_mouse_report_parsed(tusb_hid_simple_mouse_t* mouse) {
     static u8 prev_buttons = 0;
-    u8 buttons = 0;
-    s8 x, y, z;
+    u8 buttons = mouse->values.buttons & 0xFF;
 
-    if (to_bit_value(ms_items.lb, report, len)) buttons |= 0x01;
-    if (to_bit_value(ms_items.rb, report, len)) buttons |= 0x02;
-    if (to_bit_value(ms_items.mb, report, len)) buttons |= 0x04;
-    if (to_bit_value(ms_items.bw, report, len)) buttons |= 0x08;
-    if (to_bit_value(ms_items.fw, report, len)) buttons |= 0x10;
-
-    x = to_signed_value8(ms_items.x, report, len);
-    y = to_signed_value8(ms_items.y, report, len);
-    z = to_signed_value8(ms_items.z, report, len);
-
-    // Blink LED on button press/release
     if (buttons != prev_buttons) {
         led_blink_activity();
         prev_buttons = buttons;
     }
 
-    ps2_mouse_send_movement(buttons, x, y, z);
+    // Clamp values to signed 8-bit range
+    s8 x = (mouse->values.x1 > 127) ? 127 : (mouse->values.x1 < -127) ? -127 : mouse->values.x1;
+    s8 y = (mouse->values.y1 > 127) ? 127 : (mouse->values.y1 < -127) ? -127 : mouse->values.y1;
+    s8 w = (mouse->values.w1 > 127) ? 127 : (mouse->values.w1 < -127) ? -127 : mouse->values.w1;
+
+    ps2_mouse_send_movement(buttons, x, y, w);
+}
+
+//--------------------------------------------------------------------
+// Joystick Report Handling
+//--------------------------------------------------------------------
+
+// Joystick data is available via tuh_hid_get_simple_joysticks()
+// Applications can query joystick state in the main loop if needed.
+// For PS/2 output, joysticks could be mapped to keyboard keys or mouse,
+// but that requires configuration which is beyond the scope of basic support.
+
+//--------------------------------------------------------------------
+// HID Host Info Handlers
+//--------------------------------------------------------------------
+
+static void handle_keyboard_unmount(tusb_hid_host_info_t* info) {
+    (void)info;
+    if (kb_connected_count > 0) kb_connected_count--;
+    led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+}
+
+static void handle_mouse_unmount(tusb_hid_host_info_t* info) {
+    tuh_hid_free_simple_mice_for_instance(info->key.elements.dev_addr, info->key.elements.instance);
+    if (ms_connected_count > 0) ms_connected_count--;
+    led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+}
+
+static void handle_joystick_unmount(tusb_hid_host_info_t* info) {
+    tuh_hid_free_simple_joysticks_for_instance(info->key.elements.dev_addr, info->key.elements.instance);
+    if (joy_connected_count > 0) joy_connected_count--;
+}
+
+static void handle_kbd_report_cb(tusb_hid_host_info_t* info, const uint8_t* report, uint8_t report_length, uint8_t report_id) {
+    (void)report_id;
+    u8 instance = info->key.elements.instance;
+    handle_keyboard_report(instance, report, report_length);
+}
+
+static void handle_mouse_report_cb(tusb_hid_host_info_t* info, const uint8_t* report, uint8_t report_length, uint8_t report_id) {
+    tusb_hid_simple_mouse_t* mouse = tuh_hid_get_simple_mouse(
+        info->key.elements.dev_addr,
+        info->key.elements.instance,
+        report_id);
+
+    if (mouse != NULL) {
+        tusb_hid_simple_mouse_process_report(mouse, report, report_length);
+        handle_mouse_report_parsed(mouse);
+    }
+}
+
+static void handle_joystick_report_cb(tusb_hid_host_info_t* info, const uint8_t* report, uint8_t report_length, uint8_t report_id) {
+    tusb_hid_simple_joystick_t* joystick = tuh_hid_get_simple_joystick(
+        info->key.elements.dev_addr,
+        info->key.elements.instance,
+        report_id);
+
+    if (joystick != NULL) {
+        tusb_hid_simple_joystick_process_report(joystick, report, report_length);
+        // Joystick data is now available via tuh_hid_get_simple_joysticks()
+    }
 }
 
 //--------------------------------------------------------------------
@@ -344,7 +256,7 @@ static void ms_report_receive(u8 const* report, u16 len) {
 s64 kb_led_sync_callback(alarm_id_t id, void *user_data) {
     (void)id;
     (void)user_data;
-    
+
     if (hid_info[kb_inst_loop].leds && kb_last_dev != hid_info[kb_inst_loop].dev_addr) {
         tuh_hid_set_report(hid_info[kb_inst_loop].dev_addr, kb_inst_loop, 0, HID_REPORT_TYPE_OUTPUT, &kb_set_led, 1);
         kb_last_dev = hid_info[kb_inst_loop].dev_addr;
@@ -370,171 +282,242 @@ void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_
         return;
     }
 
-    hid_interface_protocol_enum_t hid_if_proto = tuh_hid_interface_protocol(dev_addr, instance);
+    hid_interface_protocol_enum_t itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
-    hid_info[instance].report_count = hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
+    // Parse report descriptor
+    hid_info[instance].report_count = tuh_hid_parse_report_descriptor_plus(
+        hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
 
-    // Force boot protocol for mice - more reliable than HID descriptor parsing
-    if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
-        tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT);
-    }
+    bool has_report_id = hid_info[instance].report_count > 1 ||
+                         (hid_info[instance].report_count > 0 && hid_info[instance].report_info[0].report_id > 0);
 
-    if (tuh_hid_receive_report(dev_addr, instance)) {
-        if (hid_if_proto == HID_ITF_PROTOCOL_MOUSE) {
-            hid_info[instance].leds = false;
-            hid_info[instance].is_mouse = true;
-            ms_connected_count++;
-        } else {
-            hid_info[instance].dev_addr = dev_addr;
-            hid_info[instance].modifiers = 0;
-            memset(hid_info[instance].boot, 0, MAX_BOOT);
-            memset(hid_info[instance].nkro, 0, MAX_NKRO);
-            hid_info[instance].leds = true;
-            hid_info[instance].is_mouse = false;
-            kb_connected_count++;
-        }
+    // Determine device type and set up handlers
+    if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        // Boot protocol keyboard
+        tuh_hid_allocate_info(dev_addr, instance, has_report_id, handle_kbd_report_cb, handle_keyboard_unmount);
+        hid_info[instance].dev_addr = dev_addr;
+        hid_info[instance].modifiers = 0;
+        memset(hid_info[instance].boot, 0, MAX_BOOT);
+        memset(hid_info[instance].nkro, 0, MAX_NKRO);
+        hid_info[instance].leds = true;
+        hid_info[instance].is_mouse = false;
+        hid_info[instance].is_joystick = false;
+        kb_connected_count++;
         led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
     }
+    else if (itf_protocol == HID_ITF_PROTOCOL_MOUSE) {
+        // Boot protocol mouse - use boot protocol for reliability
+        tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT);
+        hid_info[instance].leds = false;
+        hid_info[instance].is_mouse = true;
+        hid_info[instance].is_joystick = false;
+        ms_connected_count++;
+        led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+    }
+    else {
+        // Non-boot protocol device - parse report descriptor to determine type
+        for (u8 i = 0; i < hid_info[instance].report_count; i++) {
+            tuh_hid_report_info_plus_t* rpt = &hid_info[instance].report_info[i];
+
+            if (rpt->usage_page == HID_USAGE_PAGE_DESKTOP) {
+                switch (rpt->usage) {
+                    case HID_USAGE_DESKTOP_KEYBOARD:
+                        tuh_hid_allocate_info(dev_addr, instance, has_report_id, handle_kbd_report_cb, handle_keyboard_unmount);
+                        hid_info[instance].dev_addr = dev_addr;
+                        hid_info[instance].modifiers = 0;
+                        memset(hid_info[instance].boot, 0, MAX_BOOT);
+                        memset(hid_info[instance].nkro, 0, MAX_NKRO);
+                        hid_info[instance].leds = true;
+                        hid_info[instance].is_mouse = false;
+                        hid_info[instance].is_joystick = false;
+                        kb_connected_count++;
+                        led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+                        break;
+
+                    case HID_USAGE_DESKTOP_MOUSE:
+                        if (tuh_hid_allocate_info(dev_addr, instance, has_report_id, handle_mouse_report_cb, handle_mouse_unmount)) {
+                            tuh_hid_mouse_parse_report_descriptor(desc_report, desc_len, dev_addr, instance);
+                        }
+                        hid_info[instance].leds = false;
+                        hid_info[instance].is_mouse = true;
+                        hid_info[instance].is_joystick = false;
+                        ms_connected_count++;
+                        led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+                        break;
+
+                    case HID_USAGE_DESKTOP_GAMEPAD:
+                    case HID_USAGE_DESKTOP_JOYSTICK:
+                        if (tuh_hid_allocate_info(dev_addr, instance, has_report_id, handle_joystick_report_cb, handle_joystick_unmount)) {
+                            tuh_hid_joystick_parse_report_descriptor(desc_report, desc_len, dev_addr, instance);
+                        }
+                        hid_info[instance].leds = false;
+                        hid_info[instance].is_mouse = false;
+                        hid_info[instance].is_joystick = true;
+                        joy_connected_count++;
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+
+    // Request to receive reports
+    tuh_hid_receive_report(dev_addr, instance);
 }
 
 void tuh_hid_umount_cb(u8 dev_addr, u8 instance) {
-    (void)dev_addr;
-    if (hid_info[instance].is_mouse) {
-        if (ms_connected_count > 0) ms_connected_count--;
-    } else if (hid_info[instance].leds) {
-        if (kb_connected_count > 0) kb_connected_count--;
-    }
+    // Free host info and invoke unmount handlers
+    tuh_hid_free_info(dev_addr, instance);
+
     hid_info[instance].dev_addr = 0;
     hid_info[instance].leds = false;
     hid_info[instance].is_mouse = false;
-    led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
+    hid_info[instance].is_joystick = false;
 }
 
 void tuh_hid_report_received_cb(u8 dev_addr, u8 instance, u8 const* report, u16 len) {
-    u8 const rpt_count = hid_info[instance].report_count;
-    hid_report_info_t *rpt_infos = hid_info[instance].report_info;
-    hid_report_info_t *rpt_info = NULL;
+    // Get host info for this device
+    tusb_hid_host_info_t* info = tuh_hid_get_info(dev_addr, instance);
 
-    if (rpt_count == 1 && rpt_infos[0].report_id == 0) {
-        rpt_info = &rpt_infos[0];
-    } else {
-        u8 const rpt_id = report[0];
-        for (u8 i = 0; i < rpt_count; i++) {
-            if (rpt_id == rpt_infos[i].report_id) {
-                rpt_info = &rpt_infos[i];
-                break;
-            }
+    if (info != NULL) {
+        // Route through registered handler
+        u8 report_id = 0;
+        const u8* report_data = report;
+        u16 report_len = len;
+
+        if (info->has_report_id && len > 0) {
+            report_id = report[0];
+            report_data = report + 1;
+            report_len = len - 1;
         }
-        report++;
-        len--;
+
+        info->handler(info, report_data, report_len, report_id);
+    }
+    else {
+        // Fallback for boot protocol devices
+        hid_interface_protocol_enum_t itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+
+        if (itf_protocol == HID_ITF_PROTOCOL_MOUSE) {
+            handle_mouse_report_boot(report, len);
+        }
+        else if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+            handle_keyboard_report(instance, report, len);
+        }
     }
 
-    if (!rpt_info) {
-        tuh_hid_receive_report(dev_addr, instance);
-        return;
-    }
-    
+    // Continue receiving reports
     tuh_hid_receive_report(dev_addr, instance);
+}
 
-    // Handle mouse reports
-    if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_MOUSE) {
-        if (tuh_hid_get_protocol(dev_addr, instance) == HID_PROTOCOL_BOOT) {
-            // Boot protocol mouse - blink on button press
-            static u8 prev_buttons = 0;
-            if (report[0] != prev_buttons) {
-                led_blink_activity();
-                prev_buttons = report[0];
-            }
-            ps2_mouse_send_movement(report[0], report[1], report[2], len > 3 ? report[3] : 0);
-        } else if (rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP && rpt_info->usage == HID_USAGE_DESKTOP_MOUSE) {
-            ms_setup(rpt_info);
-            ms_report_receive(report, len);
-        }
+//--------------------------------------------------------------------
+// XInput (Xbox Controller) Support
+//--------------------------------------------------------------------
+
+// Register XInput driver with TinyUSB
+usbh_class_driver_t const* usbh_app_driver_get_cb(uint8_t* driver_count) {
+    *driver_count = 1;
+    return &usbh_xinput_driver;
+}
+
+void tuh_xinput_mount_cb(uint8_t dev_addr, uint8_t instance, const xinputh_interface_t *xinput_itf) {
+    // Wait for wireless controller connection packet
+    if (xinput_itf->type == XBOX360_WIRELESS && xinput_itf->connected == false) {
+        tuh_xinput_receive_report(dev_addr, instance);
         return;
     }
 
-    // Handle keyboard reports
-    if (rpt_info->usage_page != HID_USAGE_PAGE_DESKTOP || rpt_info->usage != HID_USAGE_DESKTOP_KEYBOARD) {
-        return;
+    // Initialize Xbox 360 wired controllers
+    if (xinput_itf->type == XBOX360_WIRED) {
+        uint8_t dummy[20];
+        tusb_control_request_t const request = {
+            .bmRequestType_bit = {
+                .recipient = TUSB_REQ_RCPT_INTERFACE,
+                .type = TUSB_REQ_TYPE_VENDOR,
+                .direction = TUSB_DIR_IN
+            },
+            .bRequest = 0x01,
+            .wValue = 0x100,
+            .wIndex = 0x00,
+            .wLength = 20
+        };
+        tuh_xfer_t xfer = {
+            .daddr = dev_addr,
+            .ep_addr = 0,
+            .setup = &request,
+            .buffer = dummy,
+            .complete_cb = NULL,
+            .user_data = 0
+        };
+        tuh_control_xfer(&xfer);
     }
 
-    // Process modifier changes
-    if (report[0] != hid_info[instance].modifiers) {
-        led_blink_activity();
-        for (u8 i = 0; i < 8; i++) {
-            if ((report[0] >> i & 1) != (hid_info[instance].modifiers >> i & 1)) {
-                ps2_keyboard_send_key(i + HID_KEY_CONTROL_LEFT, report[0] >> i & 1);
-            }
+    tuh_xinput_set_led(dev_addr, instance, 0, true);
+    tuh_xinput_set_led(dev_addr, instance, 1, true);
+    tuh_xinput_set_rumble(dev_addr, instance, 0, 0, true);
+    tuh_xinput_receive_report(dev_addr, instance);
+
+    // Allocate joystick slot for XInput device
+    tusb_hid_simple_joystick_t* joystick = tuh_hid_obtain_simple_joystick(dev_addr, instance, 0);
+    if (joystick != NULL) {
+        joystick->axis_x1.logical_min = -32768/2;
+        joystick->axis_x1.logical_max = 32768/2;
+        joystick->axis_y1.logical_min = -32768/2;
+        joystick->axis_y1.logical_max = 32768/2;
+        joystick->axis_x2.logical_min = -32768/2;
+        joystick->axis_x2.logical_max = 32768/2;
+        joystick->axis_y2.logical_min = -32768/2;
+        joystick->axis_y2.logical_max = 32768/2;
+        joystick->hat.length = 1;
+        joystick->hat.logical_max = 7;
+    }
+
+    joy_connected_count++;
+}
+
+void tuh_xinput_umount_cb(uint8_t dev_addr, uint8_t instance) {
+    tuh_hid_free_simple_joysticks_for_instance(dev_addr, instance);
+    if (joy_connected_count > 0) joy_connected_count--;
+}
+
+// Hat direction lookup table
+static const uint8_t xinput_hat_table[16] = {8, 0, 4, 8, 6, 7, 5, 8, 2, 1, 3, 8, 8, 8, 8, 8};
+
+void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance, xinputh_interface_t const* xid_itf, uint16_t len) {
+    (void)len;
+    const xinput_gamepad_t *p = &xid_itf->pad;
+
+    if (xid_itf->connected && xid_itf->new_pad_data) {
+        tusb_hid_simple_joystick_t* joystick = tuh_hid_get_simple_joystick(dev_addr, instance, 0);
+
+        if (joystick != NULL) {
+            tusb_hid_simple_joystick_values_t* values = &joystick->values;
+            values->x1 = p->sThumbLX;
+            values->y1 = -p->sThumbLY;
+            values->x2 = p->sThumbRX;
+            values->y2 = -p->sThumbRY;
+            values->hat = xinput_hat_table[p->wButtons & 0x0F];
+
+            values->buttons = 0;
+            if (p->wButtons & XINPUT_GAMEPAD_A) values->buttons |= 0x01;
+            if (p->wButtons & XINPUT_GAMEPAD_B) values->buttons |= 0x02;
+            if (p->wButtons & XINPUT_GAMEPAD_X) values->buttons |= 0x04;
+            if (p->wButtons & XINPUT_GAMEPAD_Y) values->buttons |= 0x08;
+            if (p->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) values->buttons |= 0x10;
+            if (p->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) values->buttons |= 0x20;
+            if (p->wButtons & XINPUT_GAMEPAD_BACK) values->buttons |= 0x40;
+            if (p->wButtons & XINPUT_GAMEPAD_START) values->buttons |= 0x80;
+            if (p->wButtons & XINPUT_GAMEPAD_LEFT_THUMB) values->buttons |= 0x100;
+            if (p->wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) values->buttons |= 0x200;
+            if (p->wButtons & XINPUT_GAMEPAD_GUIDE) values->buttons |= 0x400;
+
+            joystick->has_values = true;
+            joystick->updated = board_millis();
         }
-        hid_info[instance].modifiers = report[0];
     }
 
-    report++;
-    len--;
-
-    // NKRO handling (len > 12 and < 31)
-    if (len > 12 && len < 31) {
-        bool key_changed = false;
-        for (u8 i = 0; i < len && i < MAX_NKRO; i++) {
-            for (u8 j = 0; j < 8; j++) {
-                if ((report[i] >> j & 1) != (hid_info[instance].nkro[i] >> j & 1)) {
-                    key_changed = true;
-                    ps2_keyboard_send_key(i * 8 + j, report[i] >> j & 1);
-                }
-            }
-        }
-        if (key_changed) led_blink_activity();
-        memcpy(hid_info[instance].nkro, report, len > MAX_NKRO ? MAX_NKRO : len);
-        return;
-    }
-
-    // Boot protocol / 6KRO handling
-    switch (len) {
-        case 8:
-        case 7:
-            report++;
-            // fall through
-        case 6: {
-            bool key_changed = false;
-            // Check for released keys
-            for (u8 i = 0; i < MAX_BOOT; i++) {
-                if (hid_info[instance].boot[i]) {
-                    bool brk = true;
-                    for (u8 j = 0; j < MAX_BOOT; j++) {
-                        if (hid_info[instance].boot[i] == report[j]) {
-                            brk = false;
-                            break;
-                        }
-                    }
-                    if (brk) {
-                        key_changed = true;
-                        ps2_keyboard_send_key(hid_info[instance].boot[i], false);
-                    }
-                }
-            }
-
-            // Check for pressed keys
-            for (u8 i = 0; i < MAX_BOOT; i++) {
-                if (report[i]) {
-                    bool make = true;
-                    for (u8 j = 0; j < MAX_BOOT; j++) {
-                        if (report[i] == hid_info[instance].boot[j]) {
-                            make = false;
-                            break;
-                        }
-                    }
-                    if (make) {
-                        key_changed = true;
-                        ps2_keyboard_send_key(report[i], true);
-                    }
-                }
-            }
-
-            if (key_changed) led_blink_activity();
-            memcpy(hid_info[instance].boot, report, MAX_BOOT);
-            return;
-        }
-    }
+    tuh_xinput_receive_report(dev_addr, instance);
 }
 
 //--------------------------------------------------------------------
@@ -557,7 +540,7 @@ int main() {
     // Initialize PS/2 mouse emulation
     ps2_mouse_init();
 
-    // Configure HID protocol
+    // Configure HID protocol - use report protocol for better device support
     tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
 
 #if CFG_TUH_RPI_HYBRID_USB

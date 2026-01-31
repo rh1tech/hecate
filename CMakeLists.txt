@@ -25,6 +25,15 @@ add_executable(hecate
     src/ps2_mouse.c
     src/led.c
     src/hcd_hybrid.c
+    # HID Host parsing library (from pico-hid-host)
+    src/hid_host/hid_ri.c
+    src/hid_host/hid_rip.c
+    src/hid_host/hid_host_common.c
+    src/hid_host/hid_host_info.c
+    src/hid_host/hid_host_joy.c
+    src/hid_host/hid_host_mouse.c
+    src/hid_host/hid_host_utils.c
+    src/hid_host/xinput_host.c
 )
 
 # Generate PIO headers
@@ -33,6 +42,7 @@ pico_generate_pio_header(hecate ${CMAKE_CURRENT_LIST_DIR}/src/ps2out.pio)
 # Include directories
 target_include_directories(hecate PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
+    ${CMAKE_CURRENT_LIST_DIR}/src/hid_host
     # TinyUSB portable headers for rp2040_usb.h
     ${PICO_SDK_PATH}/lib/tinyusb/src/portable/raspberrypi/rp2040
 )
@@ -40,6 +50,7 @@ target_include_directories(hecate PRIVATE
 # Compile definitions
 target_compile_definitions(hecate PRIVATE
     CFG_TUH_RPI_HYBRID_USB=1
+    HID_PROTOCOL_DEFAULT=HID_PROTOCOL_REPORT
 )
 
 if(USE_WS2812)

@@ -55,6 +55,9 @@
 // HID support - enough for keyboard + mouse + extras
 #define CFG_TUH_HID                 (3*CFG_TUH_DEVICE_MAX)
 
+// XInput (Xbox controller) support
+#define CFG_TUH_XINPUT              1
+
 //--------------------------------------------------------------------
 // HID Configuration
 //--------------------------------------------------------------------

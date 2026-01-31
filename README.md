@@ -157,6 +157,10 @@ This project incorporates code and concepts from:
   - Copyright (c) 2023 Dustin Hoffman
   - Licensed under MIT License
 
+- **[pico-hid-host](https://github.com/fruit-bat/pico-hid-host)** by Fruit-Bat - HID report descriptor parsing library
+  - Copyright (c) 2024 Fruit-Bat
+  - Licensed under MIT License
+
 - **[Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB)** by sekigon-gonnoc - USB host implementation using PIO
   - Licensed under MIT License
 
