@@ -111,8 +111,8 @@ static s64 ms_send_callback(alarm_id_t id, void *user_data) {
     if (!ms_streaming) return 0;
     if (ps2out_is_busy()) return 1000000 / ms_rate;
 
-    // Always send when buttons changed, even if no movement
-    bool has_data = ms_dx || ms_dy || ms_dz || ms_db || ms_buttons_changed;
+    // Send when there's movement or button state changed
+    bool has_data = ms_dx || ms_dy || ms_dz || ms_buttons_changed;
 
     if (!has_data) {
         if (!ms_ismoving) return 1000000 / ms_rate;
@@ -267,8 +267,8 @@ static void ms_try_send(void) {
         return;
     }
 
-    // Check if there's data to send
-    bool has_data = ms_dx || ms_dy || ms_dz || ms_db || ms_buttons_changed;
+    // Check if there's data to send (movement or button state change)
+    bool has_data = ms_dx || ms_dy || ms_dz || ms_buttons_changed;
 
     if (!has_data) {
         if (!ms_ismoving) return;
