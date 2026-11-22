@@ -1,326 +1,288 @@
 /*
- * Hecate - PS/2 Mouse Emulation Driver
+ * Hecate MouseFix - PS/2 Mouse Emulation Driver
  *
- * This driver emulates a PS/2 mouse, translating USB HID mouse reports
- * to the PS/2 mouse protocol with full bidirectional communication.
- *
- * Features:
- *   - Standard 3-button PS/2 mouse protocol
- *   - IntelliMouse extensions (scroll wheel)
- *   - IntelliMouse Explorer (5-button + wheel)
- *   - Automatic protocol detection via magic sequence
- *   - Configurable sample rate (host-controlled)
- *   - Movement accumulation and overflow handling
+ * USB HID mouse reports are accumulated in the main context and emitted by
+ * ps2_mouse_task().  There is deliberately no timer callback that competes
+ * with the main loop for the packet buffer or movement counters.
  *
  * SPDX-License-Identifier: MIT
  */
 
 #include "ps2_mouse.h"
 #include "pico/stdlib.h"
-#include <stdio.h>
+#include <limits.h>
 
 static ps2out ms_out;
 
-#define MS_RATE_DEFAULT 100
+#define MS_RATE_DEFAULT 100u
+#define MS_RES_DEFAULT  2u
 
-static bool ms_streaming = false;
-static bool ms_remote = false;           // Remote mode (send on 0xEB only)
-static bool ms_ismoving = false;
-static bool ms_buttons_changed = false;  // Track button state changes
-static u32 ms_magic_seq = 0;
-static u8 ms_type = 0;      // 0=standard, 3=IntelliMouse, 4=IntelliMouse Explorer
-static u8 ms_rate = MS_RATE_DEFAULT;
-static u8 ms_db = 0;        // button state
-static u8 ms_db_prev = 0;   // previous button state for change detection
-static s16 ms_dx = 0;       // accumulated X movement
-static s16 ms_dy = 0;       // accumulated Y movement
-static s8 ms_dz = 0;        // accumulated wheel movement
+static bool ms_streaming;
+static bool ms_remote;
+static bool ms_scaling_2_1;
+static bool ms_reset_pending;
+static absolute_time_t ms_bat_deadline;
+static u32 ms_next_sample_us;
+static u32 ms_magic_seq;
+static u8 ms_type;             // 0=standard, 3=IntelliMouse, 4=Explorer
+static u8 ms_rate;
+static u8 ms_resolution;
+static u8 ms_buttons;
+static u8 ms_last_sent_buttons;
+static s32 ms_dx;
+static s32 ms_dy;
+static s32 ms_dz;
 
-static void ms_reset(void) {
-    ms_ismoving = false;
-    ms_buttons_changed = false;
-    ms_db = 0;
-    ms_db_prev = 0;
+static s32 ms_sat_add(s32 a, s32 b) {
+    if (b > 0 && a > INT32_MAX - b) return INT32_MAX;
+    if (b < 0 && a < INT32_MIN - b) return INT32_MIN;
+    return a + b;
+}
+
+static bool ms_queue(const u8 *bytes, u8 len) {
+    if (len == 0 || len > sizeof(ms_out.packet) - 1) return false;
+    for (u8 i = 0; i < len; ++i) ms_out.packet[i + 1] = bytes[i];
+    return ps2out_send(&ms_out, len);
+}
+
+static bool ms_queue_byte(u8 byte) {
+    return ms_queue(&byte, 1);
+}
+
+static void ms_clear_motion(void) {
     ms_dx = 0;
     ms_dy = 0;
     ms_dz = 0;
+    ms_buttons = 0;
+    ms_last_sent_buttons = 0;
 }
 
-static s64 ms_reset_callback(alarm_id_t id, void *user_data) {
-    (void)id;
-    (void)user_data;
-    printf("MS: Sending BAT 0xAA, type=%d\n", ms_type);
-    ms_out.packet[1] = 0xaa;
-    ms_out.packet[2] = ms_type;
-    ps2out_send(&ms_out, 2);
-    return 0;
+static void ms_schedule_bat(u32 delay_ms) {
+    ms_reset_pending = true;
+    ms_bat_deadline = make_timeout_time_ms(delay_ms);
 }
 
-static u8 ms_clamp_xyz(s16 xyz) {
-    if (xyz < -255) return 1;
-    if (xyz > 255) return 255;
-    return xyz;
+static bool ms_time_reached(absolute_time_t deadline) {
+    return absolute_time_diff_us(get_absolute_time(), deadline) <= 0;
 }
 
-static s16 ms_remain_xyz(s16 xyz) {
-    if (xyz < -255) return xyz + 255;
-    if (xyz > 255) return xyz - 255;
-    return 0;
+/*
+ * PS/2 X/Y are 9-bit signed values: sign in byte 1 and the low 8 bits in
+ * byte 2/3. The representable range is -256..255. Values outside that range
+ * set the corresponding overflow flag and are saturated.
+ */
+static u8 ms_encode_axis(s32 value, bool *negative, bool *overflow,
+                         s32 *consumed) {
+    if (value < -256) {
+        value = -256;
+        *overflow = true;
+    } else if (value > 255) {
+        value = 255;
+        *overflow = true;
+    }
+    *negative = value < 0;
+    *consumed = value;
+    return (u8)value;
 }
 
-// Build and send a movement packet immediately (for Remote Mode 0xEB response)
-static void ms_send_packet_now(void) {
-    u8 byte1 = 0x08 | (ms_db & 0x07);
-    u8 byte2 = ms_clamp_xyz(ms_dx);
-    u8 byte3 = 0x100 - ms_clamp_xyz(ms_dy);
-    s8 byte4 = 0x100 - ms_dz;
+static bool ms_build_and_queue_packet(bool remote_read) {
+    u8 packet[4];
+    u8 len = 3;
+    u8 first = 0x08 | (ms_buttons & 0x07);
+    bool x_negative = false, y_negative = false;
+    bool x_overflow = false, y_overflow = false;
+    s32 sent_x = 0, sent_y = 0;
+    s32 sent_wheel = 0;
 
-    if (ms_dx < 0) byte1 |= 0x10;
-    if (ms_dy > 0) byte1 |= 0x20;
-    if (byte2 == 0xaa) byte2 = 0xab;
-    if (byte3 == 0xaa) byte3 = 0xab;
+    // USB HID Y grows down; PS/2 Y grows up.
+    s32 y = (ms_dy == INT32_MIN) ? INT32_MAX : -ms_dy;
+    packet[1] = ms_encode_axis(ms_dx, &x_negative, &x_overflow, &sent_x);
+    packet[2] = ms_encode_axis(y, &y_negative, &y_overflow, &sent_y);
 
-    u8 len = 0;
-    ms_out.packet[++len] = byte1;
-    ms_out.packet[++len] = byte2;
-    ms_out.packet[++len] = byte3;
+    if (x_negative) first |= 0x10;
+    if (y_negative) first |= 0x20;
+    if (x_overflow) first |= 0x40;
+    if (y_overflow) first |= 0x80;
+    packet[0] = first;
 
     if (ms_type == 3 || ms_type == 4) {
-        if (byte4 < -8) byte4 = -8;
-        if (byte4 > 7) byte4 = 7;
+        s32 wheel = ms_dz;
+        if (wheel < -8) wheel = -8;
+        if (wheel > 7) wheel = 7;
+        sent_wheel = wheel;
+        packet[3] = (u8)wheel & 0x0f;
 
         if (ms_type == 4) {
-            byte4 &= 0x0f;
-            byte4 |= (ms_db << 1) & 0x30;
+            if (ms_buttons & 0x08) packet[3] |= 0x10; // back
+            if (ms_buttons & 0x10) packet[3] |= 0x20; // forward
         }
-
-        ms_out.packet[++len] = byte4;
+        len = 4;
     }
 
-    ms_dx = ms_remain_xyz(ms_dx);
-    ms_dy = ms_remain_xyz(ms_dy);
-    ms_dz = 0;
-    ms_buttons_changed = false;
-    ps2out_send(&ms_out, len);
-}
+    if (!ms_queue(packet, len)) return false;
 
-static s64 ms_send_callback(alarm_id_t id, void *user_data) {
-    (void)id;
-    (void)user_data;
+    // Consume only what was actually queued. Preserve excess motion and wheel
+    // movement for subsequent packets instead of silently dropping it.
+    ms_dx -= sent_x;
+    ms_dy += sent_y; // packet Y is inverted relative to the accumulated USB Y
 
-    if (!ms_streaming) return 0;
-    if (ps2out_is_busy()) return 1000000 / ms_rate;
-
-    // Send when there's movement or button state changed
-    bool has_data = ms_dx || ms_dy || ms_dz || ms_buttons_changed;
-
-    if (!has_data) {
-        if (!ms_ismoving) return 1000000 / ms_rate;
-        ms_ismoving = false;
+    if (ms_type == 3 || ms_type == 4) {
+        ms_dz -= sent_wheel;
     } else {
-        ms_ismoving = true;
-        ms_buttons_changed = false;  // Clear flag after we commit to send
+        // A standard PS/2 mouse has no wheel field. Do not replay old wheel
+        // deltas if the host later negotiates an IntelliMouse ID.
+        ms_dz = 0;
     }
-
-    u8 byte1 = 0x08 | (ms_db & 0x07);
-    u8 byte2 = ms_clamp_xyz(ms_dx);
-    u8 byte3 = 0x100 - ms_clamp_xyz(ms_dy);
-    s8 byte4 = 0x100 - ms_dz;
-
-    if (ms_dx < 0) byte1 |= 0x10;
-    if (ms_dy > 0) byte1 |= 0x20;
-    if (byte2 == 0xaa) byte2 = 0xab;
-    if (byte3 == 0xaa) byte3 = 0xab;
-
-    u8 len = 0;
-    ms_out.packet[++len] = byte1;
-    ms_out.packet[++len] = byte2;
-    ms_out.packet[++len] = byte3;
-
-    if (ms_type == 3 || ms_type == 4) {
-        if (byte4 < -8) byte4 = -8;
-        if (byte4 > 7) byte4 = 7;
-
-        if (ms_type == 4) {
-            byte4 &= 0x0f;
-            byte4 |= (ms_db << 1) & 0x30;
-        }
-
-        ms_out.packet[++len] = byte4;
-    }
-
-    ms_dx = ms_remain_xyz(ms_dx);
-    ms_dy = ms_remain_xyz(ms_dy);
-    ms_dz = 0;
-    ps2out_send(&ms_out, len);
-
-    return 1000000 / ms_rate;
+    ms_last_sent_buttons = ms_buttons;
+    (void)remote_read;
+    return true;
 }
 
-void ps2_mouse_send_movement(u8 buttons, s8 x, s8 y, s8 wheel) {
-    // Track button state changes to ensure clicks aren't lost
-    // even when USB reports faster than PS/2 sample rate
-    if (buttons != ms_db_prev) {
-        ms_buttons_changed = true;
-        ms_db_prev = buttons;
-    }
-    ms_db = buttons;
-    ms_dx += x;
-    ms_dy += y;
-    ms_dz += wheel;
+static void ms_reset_defaults(bool reset_id) {
+    ms_streaming = false;
+    ms_remote = false;
+    ms_scaling_2_1 = false;
+    ms_rate = MS_RATE_DEFAULT;
+    ms_resolution = MS_RES_DEFAULT;
+    ms_magic_seq = 0;
+    if (reset_id) ms_type = 0;
+    ms_clear_motion();
 }
 
 static void ms_receive(u8 byte, u8 prev_byte) {
-    switch (prev_byte) {
-        case 0xe8: // Set Resolution - data byte (ignored, just ACK)
-            break;
-
-        case 0xf3: // Set Sample Rate
-            ms_rate = byte;
-
-            ms_magic_seq = ((ms_magic_seq << 8) | byte) & 0xffffff;
-
-            // IntelliMouse magic sequence detection
-            if (ms_type == 0 && ms_magic_seq == 0xc86450) {
-                ms_type = 3;  // IntelliMouse (3-button + wheel)
-            } else if (ms_type == 3 && ms_magic_seq == 0xc8c850) {
-                ms_type = 4;  // IntelliMouse Explorer (5-button + wheel)
-            }
-
-            ms_reset();
-            break;
-
-        default:
-            switch (byte) {
-                case 0xff: // Reset
-                    add_alarm_in_ms(100, ms_reset_callback, NULL, false);
-                    ms_type = 0;
-                    // fall through
-                case 0xf6: // Set Defaults
-                    ms_rate = MS_RATE_DEFAULT;
-                    ms_remote = false;
-                    // fall through
-                case 0xf5: // Disable Data Reporting
-                    ms_streaming = false;
-                    ms_reset();
-                    break;
-
-                case 0xf4: // Enable Data Reporting (Stream Mode)
-                    printf("MS: Stream Mode ENABLED\n");
-                    ms_streaming = true;
-                    ms_remote = false;
-                    ms_reset();
-                    add_alarm_in_ms(100, ms_send_callback, NULL, false);
-                    break;
-
-                case 0xf0: // Set Remote Mode
-                    printf("MS: Remote Mode ENABLED\n");
-                    ms_streaming = false;
-                    ms_remote = true;
-                    ms_reset();
-                    break;
-
-                case 0xf3: // Set Sample Rate (command byte, data handled in outer switch)
-                case 0xe8: // Set Resolution (command byte)
-                case 0xe6: // Set Scaling 1:1
-                case 0xe7: // Set Scaling 2:1
-                    // These commands just need ACK, data byte handled separately
-                    break;
-
-                case 0xf2: // Get Device ID
-                    ms_out.packet[1] = 0xfa;
-                    ms_out.packet[2] = ms_type;
-                    ps2out_send(&ms_out, 2);
-                    ms_reset();
-                    return;
-
-                case 0xeb: // Read Data (used in Remote Mode, returns ACK + data packet)
-                    // Send ACK first, then data packet
-                    ms_out.packet[1] = 0xfa;
-                    ps2out_send(&ms_out, 1);
-                    // Then send the movement packet
-                    ms_send_packet_now();
-                    return;
-
-                case 0xe9: // Status Request
-                    ms_out.packet[1] = 0xfa;
-                    ms_out.packet[2] = (ms_streaming << 5) | (ms_remote << 6);
-                    ms_out.packet[3] = 0x02; // Resolution
-                    ms_out.packet[4] = ms_rate;
-                    ps2out_send(&ms_out, 4);
-                    return;
-
-                default:
-                    ms_reset();
-                    break;
-            }
-            break;
-    }
-
-    // Send ACK
-    ms_out.packet[1] = 0xfa;
-    ps2out_send(&ms_out, 1);
-}
-
-static void ms_try_send(void) {
-    if (!ms_streaming) {
+    // Parameter bytes are acknowledged just like command bytes.
+    if (prev_byte == 0xf3) {
+        ms_rate = byte < 10 ? 10 : (byte > 200 ? 200 : byte);
+        ms_magic_seq = ((ms_magic_seq << 8) | byte) & 0xffffff;
+        if (ms_type == 0 && ms_magic_seq == 0xc86450) {
+            ms_type = 3;
+        } else if (ms_type == 3 && ms_magic_seq == 0xc8c850) {
+            ms_type = 4;
+        }
+        (void)ms_queue_byte(0xfa);
         return;
     }
 
-    // Check if there's data to send (movement or button state change)
-    bool has_data = ms_dx || ms_dy || ms_dz || ms_buttons_changed;
-
-    if (!has_data) {
-        if (!ms_ismoving) return;
-        ms_ismoving = false;
-    } else {
-        ms_ismoving = true;
-        ms_buttons_changed = false;
+    if (prev_byte == 0xe8) {
+        ms_resolution = byte & 0x03;
+        (void)ms_queue_byte(0xfa);
+        return;
     }
 
-    u8 byte1 = 0x08 | (ms_db & 0x07);
-    u8 byte2 = ms_clamp_xyz(ms_dx);
-    u8 byte3 = 0x100 - ms_clamp_xyz(ms_dy);
-    s8 byte4 = 0x100 - ms_dz;
+    switch (byte) {
+        case 0xff: // Reset: ACK now, BAT + ID after the reset delay.
+            ms_reset_defaults(true);
+            ms_schedule_bat(500);
+            (void)ms_queue_byte(0xfa);
+            return;
 
-    if (ms_dx < 0) byte1 |= 0x10;
-    if (ms_dy > 0) byte1 |= 0x20;
-    if (byte2 == 0xaa) byte2 = 0xab;
-    if (byte3 == 0xaa) byte3 = 0xab;
+        case 0xf6: // Set Defaults
+            ms_reset_defaults(false);
+            break;
 
-    u8 len = 0;
-    ms_out.packet[++len] = byte1;
-    ms_out.packet[++len] = byte2;
-    ms_out.packet[++len] = byte3;
+        case 0xf5: // Disable Data Reporting
+            ms_streaming = false;
+            ms_clear_motion();
+            break;
 
-    if (ms_type == 3 || ms_type == 4) {
-        if (byte4 < -8) byte4 = -8;
-        if (byte4 > 7) byte4 = 7;
+        case 0xf4: // Enable Data Reporting
+            ms_streaming = true;
+            ms_remote = false;
+            ms_clear_motion();
+            ms_next_sample_us = time_us_32();
+            break;
 
-        if (ms_type == 4) {
-            byte4 &= 0x0f;
-            byte4 |= (ms_db << 1) & 0x30;
+        case 0xf0: // Set Remote Mode
+            ms_streaming = false;
+            ms_remote = true;
+            ms_clear_motion();
+            break;
+
+        case 0xea: // Set Stream Mode
+            ms_remote = false;
+            break;
+
+        case 0xe6: // Scaling 1:1
+            ms_scaling_2_1 = false;
+            break;
+
+        case 0xe7: // Scaling 2:1
+            ms_scaling_2_1 = true;
+            break;
+
+        case 0xf3: // Set Sample Rate; next byte is parameter
+        case 0xe8: // Set Resolution; next byte is parameter
+            break;
+
+        case 0xf2: { // Get Device ID
+            u8 response[] = { 0xfa, ms_type };
+            (void)ms_queue(response, sizeof(response));
+            return;
         }
 
-        ms_out.packet[++len] = byte4;
+        case 0xeb: { // Read Data (Remote Mode)
+            u8 ack = 0xfa;
+            if (ms_queue_byte(ack)) {
+                (void)ms_build_and_queue_packet(true);
+            }
+            return;
+        }
+
+        case 0xe9: { // Status Request
+            u8 status = (ms_buttons & 0x07) |
+                        (ms_scaling_2_1 ? 0x10 : 0) |
+                        (ms_streaming ? 0x20 : 0) |
+                        (ms_remote ? 0x40 : 0);
+            u8 response[] = { 0xfa, status, ms_resolution, ms_rate };
+            (void)ms_queue(response, sizeof(response));
+            return;
+        }
+
+        default:
+            // Unknown commands are still acknowledged, matching common mice.
+            break;
     }
 
-    ms_dx = ms_remain_xyz(ms_dx);
-    ms_dy = ms_remain_xyz(ms_dy);
-    ms_dz = 0;
-    ps2out_send(&ms_out, len);
+    (void)ms_queue_byte(0xfa);
+}
+
+void ps2_mouse_send_movement(u8 buttons, s8 x, s8 y, s8 wheel) {
+    ms_buttons = buttons & 0x1f;
+    ms_dx = ms_sat_add(ms_dx, x);
+    ms_dy = ms_sat_add(ms_dy, y);
+    ms_dz = ms_sat_add(ms_dz, wheel);
 }
 
 bool ps2_mouse_task(void) {
     ps2out_task(&ms_out);
-    ms_try_send();
-    return ms_streaming && !ps2out_is_busy();
+
+    // Defer BAT transmission to the main loop; no alarm callback touches the
+    // same queue or packet buffer as the USB and PS/2 paths.
+    if (ms_reset_pending && ms_time_reached(ms_bat_deadline)) {
+        u8 bat[] = { 0xaa, ms_type };
+        if (ms_queue(bat, sizeof(bat))) ms_reset_pending = false;
+    }
+
+    if (ms_streaming && !ms_remote) {
+        u32 now = time_us_32();
+        u32 interval = 1000000u / (ms_rate ? ms_rate : 1u);
+        bool changed = (ms_buttons != ms_last_sent_buttons);
+        bool moved = (ms_dx != 0 || ms_dy != 0 ||
+                      ((ms_type == 3 || ms_type == 4) && ms_dz != 0));
+
+        if ((changed || moved) && (s32)(now - ms_next_sample_us) >= 0) {
+            if (ms_build_and_queue_packet(false)) {
+                ms_next_sample_us = now + interval;
+            }
+        }
+    }
+
+    return ms_streaming && !ps2out_is_busy(&ms_out);
 }
 
 void ps2_mouse_init(void) {
-    // Use state machine 2 for mouse (keyboard uses SM 0)
+    ms_reset_pending = false;
+    ms_reset_defaults(true);
     ps2out_init(&ms_out, 2, PS2_MOUSE_DATA_PIN, &ms_receive);
-
-    // Delay BAT completion to allow host to boot
-    add_alarm_in_ms(500, ms_reset_callback, NULL, false);
+    ms_schedule_bat(500);
 }

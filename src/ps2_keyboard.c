@@ -281,7 +281,7 @@ s64 ps2_keyboard_led_callback(void) {
 
 bool ps2_keyboard_task(void) {
     ps2out_task(&kb_out);
-    return kb_enabled && !ps2out_is_busy();
+    return kb_enabled && !ps2out_is_busy(&kb_out);
 }
 
 void ps2_keyboard_init(void) {
