@@ -37,7 +37,7 @@ typedef struct {
     u8 last_rx;
     u8 last_tx;
     u8 sent;
-    u8 busy;
+    u8 busy;            // Inter-byte settling delay (main-loop ticks)
 } ps2out;
 
 // Initialize PS/2 output
@@ -52,9 +52,9 @@ void ps2out_init_ex(ps2out* this, u8 sm, u8 data_pin, u8 clk_pin, rx_callback rx
 void ps2out_task(ps2out* this);
 
 // Queue packet for sending (packet[0] = length, packet[1..] = data)
-void ps2out_send(ps2out* this, u8 len);
+bool ps2out_send(ps2out* this, u8 len);
 
-// Check if PS/2 bus is busy
-bool ps2out_is_busy(void);
+// Check whether this PS/2 port is currently transmitting.
+bool ps2out_is_busy(ps2out* this);
 
 #endif // PS2OUT_H

@@ -30,9 +30,15 @@ static u32 ps2_frame(u8 byte) {
     return ((1 << 10) | (parity << 9) | (byte << 1)) ^ 0x7ff;
 }
 
-void ps2out_send(ps2out* this, u8 len) {
+bool ps2out_send(ps2out* this, u8 len) {
+    if (this == NULL || len == 0 || len > sizeof(this->packet) - 1) {
+        return false;
+    }
+
     this->packet[0] = len;
-    queue_try_add(&this->packets, &this->packet);
+    // queue_try_add copies all 9 bytes into the queue. Never assume success:
+    // callers that own movement state must retain it if the queue is full.
+    return queue_try_add(&this->packets, this->packet);
 }
 
 void ps2out_init(ps2out* this, u8 sm, u8 data_pin, rx_callback rx_function) {
@@ -59,26 +65,26 @@ void ps2out_init_ex(ps2out* this, u8 sm, u8 data_pin, u8 clk_pin, rx_callback rx
     ps2out_program_init_ex(pio1, sm, ps2out_prg, data_pin, clk_pin);
 }
 
-bool ps2out_is_busy(void) {
-    // Check if any state machine has its busy flag set
-    // SM 0 = keyboard, SM 2 = mouse
-    return pio_interrupt_get(pio1, 0) || pio_interrupt_get(pio1, 2);
+bool ps2out_is_busy(ps2out* this) {
+    if (this == NULL) return true;
+    return pio_interrupt_get(pio1, this->sm);
 }
 
 void ps2out_task(ps2out* this) {
     u8 packet[9];
 
-    // Check busy flag (IRQ 0 relative to state machine)
+    // Preserve the original Hecate inter-byte settling delay. The PIO busy
+    // IRQ indicates active bus ownership; the software delay additionally
+    // gives the state machine/main loop time to settle between queued bytes.
     bool is_busy = pio_interrupt_get(pio1, this->sm);
-    
+
     if (this->busy) {
         this->busy--;
-        if (is_busy) {
-            this->busy = 0;
-        }
+        if (is_busy) this->busy = 0;
     }
 
-    // Check if we can send: not busy, both lines high, and have data to send
+    // Send only when the device is idle, the settling delay expired, and both
+    // open-drain lines are released.
     if (!this->busy && !is_busy &&
         gpio_get(this->data_pin) && gpio_get(this->clk_pin) &&
         queue_try_peek(&this->packets, &packet)) {

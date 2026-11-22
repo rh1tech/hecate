@@ -163,6 +163,7 @@ static void handle_keyboard_report(u8 instance, u8 const* report, u16 len) {
 
 static void handle_mouse_report_boot(u8 const* report, u16 len) {
     static u8 prev_buttons = 0;
+    if (report == NULL || len < 3) return;
 
     if (report[0] != prev_buttons) {
         led_blink_activity();

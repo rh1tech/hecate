@@ -28,6 +28,13 @@ Named after Hecate, the ancient Greek goddess of crossroads and liminal spaces. 
 - **Special sequences** - Proper Pause/Break and Print Screen handling
 
 ### PS/2 Mouse Emulation
+- Single main-loop transmission path; removed the competing periodic timer sender
+- Per-port PS/2 busy detection so keyboard activity does not block mouse scheduling
+- Queue insertion reports failure; movement is retained when a packet cannot be queued
+- 9-bit signed X/Y packet encoding with sign and overflow flags
+- Correct USB-down / PS/2-up Y-axis conversion
+- Signed IntelliMouse wheel nibble and Explorer back/forward button bits
+- Deferred BAT response is serviced in the main loop rather than an alarm callback
 - **Standard 3-button mouse** - Left, right, middle buttons
 - **IntelliMouse** - Scroll wheel support (auto-detected)
 - **IntelliMouse Explorer** - 5-button support (auto-detected)
