@@ -163,6 +163,7 @@ static void handle_keyboard_report(u8 instance, u8 const* report, u16 len) {
 
 static void handle_mouse_report_boot(u8 const* report, u16 len) {
     static u8 prev_buttons = 0;
+    if (report == NULL || len < 3) return;
 
     if (report[0] != prev_buttons) {
         led_blink_activity();
@@ -306,8 +307,15 @@ void tuh_hid_mount_cb(u8 dev_addr, u8 instance, u8 const* desc_report, u16 desc_
         led_set_connected(kb_connected_count > 0, ms_connected_count > 0);
     }
     else if (itf_protocol == HID_ITF_PROTOCOL_MOUSE) {
-        // Boot protocol mouse - use boot protocol for reliability
-        tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT);
+        // Keep the mouse in Report Protocol. Boot Protocol reports only
+        // buttons + X/Y (3 bytes), so the wheel data is not available.
+        // The parsed report descriptor provides X/Y, wheel and button fields.
+        if (tuh_hid_allocate_info(dev_addr, instance, has_report_id,
+                                 handle_mouse_report_cb, handle_mouse_unmount)) {
+            tuh_hid_mouse_parse_report_descriptor(desc_report, desc_len,
+                                                  dev_addr, instance);
+        }
+
         hid_info[instance].leds = false;
         hid_info[instance].is_mouse = true;
         hid_info[instance].is_joystick = false;
