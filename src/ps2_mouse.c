@@ -106,10 +106,19 @@ static bool ms_build_and_queue_packet(bool remote_read) {
     packet[0] = first;
 
     if (ms_type == 3 || ms_type == 4) {
-        s32 wheel = ms_dz;
-        if (wheel < -8) wheel = -8;
-        if (wheel > 7) wheel = 7;
-        sent_wheel = wheel;
+        // Invert the USB wheel direction for PS/2. The IntelliMouse wheel
+        // field is a signed 4-bit value (-8..7), so clamp the inverted value
+        // and consume only the corresponding amount from the original delta.
+        // This also handles the asymmetric -8..7 range without losing motion.
+        s32 wheel;
+        if (ms_dz < -7) {
+            wheel = 7;
+        } else if (ms_dz > 8) {
+            wheel = -8;
+        } else {
+            wheel = -ms_dz;
+        }
+        sent_wheel = -wheel;
         packet[3] = (u8)wheel & 0x0f;
 
         if (ms_type == 4) {
